@@ -33,11 +33,7 @@ main() {
     enable_bbr
     raise_service_nofile
 
-    # Backup 3X-UI database before any changes
     local backup_path
-    backup_path="${XUI_DB}.bak.$(date +%Y%m%d-%H%M%S)"
-    cp "$XUI_DB" "$backup_path"
-    log_ok "Database backup saved: $backup_path"
 
     # --- Step 1: Validate existing installation ---
     log_info "=== Checking existing installation ==="
@@ -54,11 +50,23 @@ main() {
         exit 1
     fi
 
+    # Backup 3X-UI database before any changes. After the existence checks: sqlite3
+    # would silently create an empty DB at a missing path.
+    backup_path="${XUI_DB}.bak.$(date +%Y%m%d-%H%M%S)"
+    xui_db_backup "$backup_path"
+    # bootstrap_api_token may re-issue the token later in this run; a DB rollback
+    # would bring back the old api_tokens row, so the plaintext file has to roll
+    # back with it or vpn/selfcheck lose API access until the next update.
+    if [[ -f "$XUI_API_TOKEN_FILE" ]]; then
+        install -m 0600 "$XUI_API_TOKEN_FILE" "${backup_path}.api-token"
+    fi
+    log_ok "Database backup saved: $backup_path"
+
     # --- Step 2: Extract current values ---
     log_info "=== Reading current configuration ==="
 
     local template
-    template=$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='xrayTemplateConfig';")
+    template=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='xrayTemplateConfig';")
 
     if [[ -z "$template" ]]; then
         log_error "No xray template config found in 3X-UI database"
@@ -86,28 +94,38 @@ main() {
     log_info "  API port: $api_port"
 
     # Read panel/subscription ports from DB
-    local panel_port sub_port sub_enable
-    panel_port=$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='webPort';") || true
-    sub_enable=$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='subEnable';") || true
+    local panel_port sub_port sub_enable sub_port_raw
+    panel_port=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='webPort';") || true
+    sub_port_raw=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='subPort';") || true
+    sub_enable=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='subEnable';") || true
     sub_port=""
     if [[ "$sub_enable" == "true" ]]; then
-        sub_port=$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='subPort';") || true
+        sub_port=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='subPort';") || true
     fi
 
     local is_selfsteal=false
     local current_dest
     current_dest=$(sqlite3 "$XUI_DB" \
-        "SELECT stream_settings FROM inbounds WHERE tag='inbound-443';" | \
+        <<< "SELECT stream_settings FROM inbounds WHERE tag='inbound-443';" | \
         jq -r '.realitySettings.dest') || true
     if [[ "$current_dest" == *"caddy.sock"* ]]; then
         is_selfsteal=true
         log_info "SelfSteal mode detected"
     fi
 
+    # SelfSteal: is the subscription served through Caddy (subscription domain set)?
+    # Only then bind it to loopback and close its UFW port (issue #40).
+    local sub_bind="" sub_close_port="" sub_domain_db
+    sub_domain_db=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='subDomain';") || true
+    if [[ "$is_selfsteal" == true && -n "$sub_domain_db" ]]; then
+        sub_bind="with-sub"
+        sub_close_port="$sub_port_raw"
+    fi
+
     local is_cdn=false
     local cdn_settings
     cdn_settings=$(sqlite3 "$XUI_DB" \
-        "SELECT settings FROM inbounds WHERE tag='inbound-cdn';" 2>/dev/null) || true
+        <<< "SELECT settings FROM inbounds WHERE tag='inbound-cdn';" 2>/dev/null) || true
     if [[ -n "$cdn_settings" ]]; then
         is_cdn=true
         log_info "CDN mode detected"
@@ -116,7 +134,7 @@ main() {
     # Detect current relay inbound transport (TCP or XHTTP)
     local current_network
     current_network=$(sqlite3 "$XUI_DB" \
-        "SELECT stream_settings FROM inbounds WHERE tag='inbound-443';" | \
+        <<< "SELECT stream_settings FROM inbounds WHERE tag='inbound-443';" | \
         jq -r '.network') || true
     if [[ "$current_network" == "xhttp" ]]; then
         log_info "XHTTP inbound detected"
@@ -142,27 +160,20 @@ main() {
     # --- Step 4: Upgrade 3X-UI (optional) ---
     if [[ "$upgrade" == true ]]; then
         log_info "=== Upgrading 3X-UI ==="
-        # Pinned to v3.1.0 — see scripts/lib/3xui.sh:install_3xui. First start of
-        # v3.1.0 runs the seeder, migrating existing JSON clients into the normalized
-        # clients/client_inbounds tables (subscriptions survive upgrade).
-        # On an already-configured panel install.sh skips the DB/port prompts; the
-        # only question is SSL (and, when SSL=4 is picked, a bind-to-127.0.0.1 y/N).
-        # So the SSL answer (4 = Skip) must be FIRST here — unlike the fresh-install
-        # feed in install_3xui, which has DB+port prompts ahead of it. A leading blank
-        # would land on the SSL prompt and default it to option 2 (LE IP cert, acme on
-        # :80, collides with Caddy).
-        {
-            printf '4\n'  # SSL method         → Skip SSL
-            printf '\n'   # Bind to 127.0.0.1? → N (all interfaces)
-            printf '\n%.0s' {1..98}  # any further/unexpected prompts: accept defaults
-        } > /tmp/xui-answers
-        bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/v3.1.0/install.sh) v3.1.0 < /tmp/xui-answers
-        rm -f /tmp/xui-answers
-        log_ok "3X-UI upgraded to v3.1.0 (seeder migrated existing clients)"
+        # Pinned version + non-interactive flags: see run_3xui_installer in
+        # scripts/lib/3xui.sh. The installer ends with `x-ui migrate` and starts the
+        # panel, so the seeders run here: v2.x JSON clients move into the normalized
+        # clients/client_inbounds tables, and (crossing v3.3.1) existing api_tokens
+        # rows are rewritten as SHA-256. The bootstrap_api_token call in Step 5
+        # below then re-checks our token against the hashed format and re-issues it
+        # if it doesn't match — that is what repairs relays upgraded from v3.1.0.
+        run_3xui_installer
+        log_ok "3X-UI upgraded to ${XUI_VERSION} (seeders migrated existing clients/tokens)"
 
         if [[ "$is_selfsteal" == true ]]; then
             log_info "Upgrading Caddy..."
-            apt-get update -qq && apt-get install -y -qq caddy > /dev/null 2>&1
+            apt_update_retry
+            apt-get install -y -qq caddy > /dev/null 2>&1
             log_ok "Caddy upgraded"
         fi
     fi
@@ -180,18 +191,30 @@ main() {
     x-ui stop
 
     # Bootstrap the REST API token while x-ui is stopped (loads fresh on the start
-    # below; no later restart to flush it). Idempotent — reuses an existing valid token.
+    # below; no later restart to flush it). Idempotent — reuses an existing valid token,
+    # re-issues it if the row no longer matches (e.g. plaintext row on a v3.3.1+ panel
+    # that hashes tokens — the post-`--upgrade` repair path).
     bootstrap_api_token
+    # Installer tokens: relays set up before this fix still carry "install", and an
+    # --upgrade that reset default credentials mints "cli-fallback".
+    revoke_installer_api_tokens
+
+    # SelfSteal: panel + subscription server on loopback only — Caddy is the only
+    # way in (issue #40). Relays set up before v1.13.0 listened on 0.0.0.0.
+    if [[ "$is_selfsteal" == true ]]; then
+        xui_bind_loopback "$sub_bind"
+        log_ok "3X-UI panel/subscription bound to 127.0.0.1 (access via Caddy domains)"
+    fi
 
     # Patch inbound sniffing to add routeOnly (idempotent — jq sets the field)
     local current_sniffing patched_sniffing
     current_sniffing=$(sqlite3 "$XUI_DB" \
-        "SELECT sniffing FROM inbounds WHERE tag='inbound-443';") || true
+        <<< "SELECT sniffing FROM inbounds WHERE tag='inbound-443';") || true
     if [[ -n "$current_sniffing" ]]; then
         patched_sniffing=$(echo "$current_sniffing" | jq -c '.routeOnly = true')
         local s_sniffing="${patched_sniffing//\'/\'\'}"
         sqlite3 "$XUI_DB" \
-            "UPDATE inbounds SET sniffing='${s_sniffing}' WHERE tag='inbound-443';"
+            <<< "UPDATE inbounds SET sniffing='${s_sniffing}' WHERE tag='inbound-443';"
         log_ok "Inbound sniffing patched (routeOnly: true)"
     fi
 
@@ -207,11 +230,11 @@ main() {
 
         local current_stream patched_stream
         current_stream=$(sqlite3 "$XUI_DB" \
-            "SELECT stream_settings FROM inbounds WHERE tag='inbound-443';")
+            <<< "SELECT stream_settings FROM inbounds WHERE tag='inbound-443';")
         # Write xhttpSettings complete with extra in a single pass —
         # prevents fragility if the post-migration patch block is skipped/reordered.
         patched_stream=$(echo "$current_stream" | jq -c \
-            --arg relay_path "$relay_xhttp_path" \
+            --rawfile relay_path <(printf '%s' "$relay_xhttp_path") \
             --argjson extra "$extra_json" \
             '.network = "xhttp"
             | .xhttpSettings = {
@@ -222,20 +245,20 @@ main() {
             | del(.tcpSettings)')
         local s_stream="${patched_stream//\'/\'\'}"
         sqlite3 "$XUI_DB" \
-            "UPDATE inbounds SET stream_settings='${s_stream}' WHERE tag='inbound-443';"
+            <<< "UPDATE inbounds SET stream_settings='${s_stream}' WHERE tag='inbound-443';"
         # Clear flow from all clients — flow is incompatible with XHTTP
         # (Shadowrocket and other clients connect without flow on XHTTP)
         local current_settings patched_settings
         current_settings=$(sqlite3 "$XUI_DB" \
-            "SELECT settings FROM inbounds WHERE tag='inbound-443';")
+            <<< "SELECT settings FROM inbounds WHERE tag='inbound-443';")
         patched_settings=$(echo "$current_settings" | jq -c \
             '.clients = [.clients[] | .flow = ""]')
         local s_settings="${patched_settings//\'/\'\'}"
         sqlite3 "$XUI_DB" \
-            "UPDATE inbounds SET settings='${s_settings}' WHERE tag='inbound-443';"
+            <<< "UPDATE inbounds SET settings='${s_settings}' WHERE tag='inbound-443';"
         # v3: keep the normalized clients table in sync (flow column). Guarded no-op
         # if the table doesn't exist (relay not yet upgraded to v3 in this run).
-        sqlite3 "$XUI_DB" "UPDATE clients SET flow='' WHERE flow != '';" 2>/dev/null || true
+        sqlite3 "$XUI_DB" <<< "UPDATE clients SET flow='' WHERE flow != '';" 2>/dev/null || true
 
         log_ok "Relay inbound migrated from TCP to XHTTP"
     fi
@@ -248,7 +271,7 @@ main() {
     local current_inbound_stream updated_inbound_stream lf_json
     lf_json=$(reality_limit_fallback_json)
     current_inbound_stream=$(sqlite3 "$XUI_DB" \
-        "SELECT stream_settings FROM inbounds WHERE tag='inbound-443';") || true
+        <<< "SELECT stream_settings FROM inbounds WHERE tag='inbound-443';") || true
     if [[ -n "$current_inbound_stream" && \
           "$(echo "$current_inbound_stream" | jq -r '.network')" == "xhttp" ]]; then
         updated_inbound_stream=$(echo "$current_inbound_stream" | jq -c \
@@ -262,7 +285,7 @@ main() {
         fi
         local s_inbound_stream="${updated_inbound_stream//\'/\'\'}"
         sqlite3 "$XUI_DB" \
-            "UPDATE inbounds SET stream_settings='${s_inbound_stream}' WHERE tag='inbound-443';"
+            <<< "UPDATE inbounds SET stream_settings='${s_inbound_stream}' WHERE tag='inbound-443';"
         log_ok "XHTTP inbound patched (extra block + Reality limitFallback)"
     fi
 
@@ -290,7 +313,7 @@ main() {
     if systemctl is-active --quiet x-ui; then
         for _ in 1 2 3 4 5; do
             sleep 1
-            if ss -tln 2>/dev/null | grep -qE ':443\s'; then
+            if [[ -n "$(ss -tlnH 'sport = :443' 2>/dev/null)" ]]; then
                 xray_healthy=true
                 break
             fi
@@ -299,11 +322,21 @@ main() {
 
     if [[ "$xray_healthy" != true ]]; then
         log_warn "3X-UI/xray failed to bind :443 — restoring DB backup..."
-        x-ui stop || true
-        cp "$backup_path" "$XUI_DB"
+        if ! xui_db_restore "$backup_path"; then
+            log_error "Rollback failed: could not stop x-ui. Restore $backup_path manually"
+            exit 1
+        fi
+        if [[ -f "${backup_path}.api-token" ]]; then
+            install -m 0600 "${backup_path}.api-token" "$XUI_API_TOKEN_FILE"
+            rm -f "${backup_path}.api-token"
+        else
+            # No token before this run: one bootstrapped now has no row in the
+            # restored DB — drop it so the next update-relay re-issues cleanly.
+            rm -f "$XUI_API_TOKEN_FILE"
+        fi
         x-ui start
         sleep 3
-        if systemctl is-active --quiet x-ui && ss -tln 2>/dev/null | grep -qE ':443\s'; then
+        if systemctl is-active --quiet x-ui && [[ -n "$(ss -tlnH 'sport = :443' 2>/dev/null)" ]]; then
             log_ok "Previous database restored, 3X-UI is running"
         else
             log_error "Rollback also failed. Check: x-ui log"
@@ -311,6 +344,9 @@ main() {
         exit 1
     fi
     log_ok "3X-UI restarted with updated template (xray bound :443)"
+    # Past the only rollback point — the plaintext token copy is no longer needed
+    rm -f "${backup_path}.api-token"
+    prune_backups "${XUI_DB}.bak." 5
 
     # Re-assert the CDN client set via API. The upgrade seeder migrated relay clients
     # into the normalized tables; the CDN "-cdn" variants are ours to reconcile.
@@ -319,8 +355,7 @@ main() {
     fi
 
     # --- Step 5b: Update extra links in sub-proxy if active ---
-    local sub_proxy_service="/etc/systemd/system/sub-proxy.service"
-    if [[ -f "$sub_proxy_service" ]]; then
+    if [[ -f "$SUB_PROXY_UNIT" ]]; then
         log_info "Updating links in sub-proxy..."
 
         # Update sub-proxy script and config templates from codebase
@@ -333,21 +368,22 @@ main() {
         install -m 0644 "$script_dir/lib/templates/happ-routing-ru.json" /etc/sub-proxy/happ-routing-ru.json
         install -m 0644 "$script_dir/lib/templates/share-page.html" /etc/sub-proxy/share-page.html
 
-        # Read CDN params — prefer dedicated env vars, fall back to old URL parsing
-        local cdn_domain cdn_path
-        cdn_domain=$(grep -oP '(?<=CDN_DOMAIN=).+' "$sub_proxy_service") || true
-        cdn_path=$(grep -oP '(?<=CDN_PATH=).+' "$sub_proxy_service") || true
+        # Read params from the env file (v1.13.1+) or the old unit's Environment= lines.
+        # Pre-v1.4.0 units had no CDN_DOMAIN/CDN_PATH — parse them from the VLESS URL.
+        local cdn_domain cdn_path old_cdn_link
+        cdn_domain=$(sub_proxy_env_get CDN_DOMAIN)
+        cdn_path=$(sub_proxy_env_get CDN_PATH)
         if [[ -z "$cdn_domain" ]]; then
-            # Migration from old format: parse from VLESS URL
-            cdn_domain=$(grep 'CDN_VLESS_LINK=' "$sub_proxy_service" | grep -oP '(?<=@)[^:]+' | head -1) || true
-            cdn_path=$(grep 'CDN_VLESS_LINK=' "$sub_proxy_service" | grep -oP '(?<=path=%%2F)[^&]+' | head -1) || true
+            old_cdn_link=$(sub_proxy_env_get CDN_VLESS_LINK)
+            cdn_domain=$(printf '%s' "$old_cdn_link" | grep -oP '(?<=@)[^:]+' | head -1) || true
+            cdn_path=$(printf '%s' "$old_cdn_link" | grep -oP '(?<=path=%2F)[^&]+' | head -1) || true
         fi
 
         # Read Hysteria params from existing service, then override with CLI args
         local hy_port hy_port_end hy_obfs
-        hy_port=$(grep -oP '(?<=HYSTERIA_PORT=).+' "$sub_proxy_service") || true
-        hy_port_end=$(grep -oP '(?<=HYSTERIA_PORT_END=).+' "$sub_proxy_service") || true
-        hy_obfs=$(grep -oP '(?<=HYSTERIA_OBFS=).+' "$sub_proxy_service") || true
+        hy_port=$(sub_proxy_env_get HYSTERIA_PORT)
+        hy_port_end=$(sub_proxy_env_get HYSTERIA_PORT_END)
+        hy_obfs=$(sub_proxy_env_get HYSTERIA_OBFS)
 
         # CLI args override service file values (for adding/updating Hysteria)
         [[ -n "$arg_hy_port" ]] && hy_port="$arg_hy_port"
@@ -360,10 +396,6 @@ main() {
         fi
 
         if [[ -n "$cdn_domain" && -n "$cdn_path" ]] || [[ -n "$hy_port" && -n "$hy_obfs" ]]; then
-            # Read ExecStart from existing service file
-            local exec_start
-            exec_start=$(grep -oP '(?<=ExecStart=).+' "$sub_proxy_service") || true
-
             # CDN links — only when CDN Fallback is configured
             local cdn_vless_link="" cdn_vless_link_asym=""
             if [[ -n "$cdn_domain" && -n "$cdn_path" ]]; then
@@ -375,10 +407,10 @@ main() {
                 local download_extra extra_encoded
                 download_extra=$(jq -n -c \
                     --arg padding "100-1000" \
-                    --arg addr "$exit_ip" \
-                    --arg sni "$exit_sni" \
-                    --arg pubkey "$exit_pubkey" \
-                    --arg sid "$exit_short_id" \
+                    --rawfile addr <(printf '%s' "$exit_ip") \
+                    --rawfile sni <(printf '%s' "$exit_sni") \
+                    --rawfile pubkey <(printf '%s' "$exit_pubkey") \
+                    --rawfile sid <(printf '%s' "$exit_short_id") \
                     '{
                         xPaddingBytes: $padding,
                         downloadSettings: {
@@ -392,7 +424,7 @@ main() {
                             }
                         }
                     }')
-                extra_encoded=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$download_extra")
+                extra_encoded=$(url_quote "$download_extra")
                 cdn_vless_link_asym="vless://${exit_uuid}@${cdn_domain}:443?type=xhttp&security=tls&sni=${cdn_domain}&host=${cdn_domain}&path=%2F${cdn_path}&mode=packet-up&extra=${extra_encoded}#CDN%20Asymmetric"
             fi
 
@@ -409,60 +441,62 @@ main() {
             # URL-encoded XHTTP extra — sub-proxy injects into each relay VLESS URL
             # since 3X-UI's built-in subscription generator does not emit extra=.
             local relay_extra_encoded
-            relay_extra_encoded=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$extra_json")
-
-            # Escape % for systemd
-            local link_escaped="${cdn_vless_link//%/%%}"
-            local link_asym_escaped="${cdn_vless_link_asym//%/%%}"
-            local direct_escaped="${direct_vless_link//%/%%}"
-            local hysteria_escaped="${hysteria_link//%/%%}"
-            local relay_extra_escaped="${relay_extra_encoded//%/%%}"
+            relay_extra_encoded=$(url_quote "$extra_json")
 
             # Read existing service params
             local sub_upstream sub_proxy_port
-            sub_upstream=$(grep -oP '(?<=SUB_UPSTREAM=).+' "$sub_proxy_service") || true
-            sub_proxy_port=$(grep -oP '(?<=SUB_PROXY_PORT=).+' "$sub_proxy_service") || true
+            sub_upstream=$(sub_proxy_env_get SUB_UPSTREAM)
+            sub_proxy_port=$(sub_proxy_env_get SUB_PROXY_PORT)
 
-            # Backup before rewriting — restore on regen failure
-            local sub_proxy_backup
-            sub_proxy_backup="${sub_proxy_service}.bak.$(date +%Y%m%d-%H%M%S)"
-            cp "$sub_proxy_service" "$sub_proxy_backup"
+            # Backup unit + env file before rewriting (root-only tmp dir: both hold
+            # or held links with the exit UUID) — restore on regen failure.
+            local sub_proxy_bak had_env=false
+            sub_proxy_bak=$(mktemp -d /run/vpn-sub-proxy.XXXXXX)
+            cp -p "$SUB_PROXY_UNIT" "$sub_proxy_bak/unit"
+            if [[ -f "$SUB_PROXY_ENV" ]]; then
+                cp -p "$SUB_PROXY_ENV" "$sub_proxy_bak/env"
+                had_env=true
+            fi
 
-            # Rewrite entire service file (never sed — & in URLs breaks sed)
-            cat > "$sub_proxy_service" << SVCEOF
-[Unit]
-Description=Subscription proxy (appends extra links)
-After=x-ui.service
-
-[Service]
-Type=simple
-Environment=CDN_VLESS_LINK=${link_escaped}
-Environment=CDN_VLESS_LINK_ASYM=${link_asym_escaped}
-Environment=DIRECT_VLESS_LINK=${direct_escaped}
-Environment=HYSTERIA_LINK=${hysteria_escaped}
-Environment=HYSTERIA_PORT=${hy_port}
-Environment=HYSTERIA_PORT_END=${hy_port_end}
-Environment=HYSTERIA_OBFS=${hy_obfs}
-Environment=CDN_DOMAIN=${cdn_domain}
-Environment=CDN_PATH=${cdn_path}
-Environment=RELAY_XHTTP_EXTRA=${relay_extra_escaped}
-Environment=SUB_UPSTREAM=${sub_upstream}
-Environment=SUB_PROXY_PORT=${sub_proxy_port}
-ExecStart=${exec_start}
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
+            # Rewrite both files entirely (never sed — & in URLs breaks sed)
+            if ! write_sub_proxy_env \
+                "CDN_VLESS_LINK=${cdn_vless_link}" \
+                "CDN_VLESS_LINK_ASYM=${cdn_vless_link_asym}" \
+                "DIRECT_VLESS_LINK=${direct_vless_link}" \
+                "HYSTERIA_LINK=${hysteria_link}" \
+                "HYSTERIA_PORT=${hy_port}" \
+                "HYSTERIA_PORT_END=${hy_port_end}" \
+                "HYSTERIA_OBFS=${hy_obfs}" \
+                "CDN_DOMAIN=${cdn_domain}" \
+                "CDN_PATH=${cdn_path}" \
+                "RELAY_XHTTP_EXTRA=${relay_extra_encoded}" \
+                "SUB_UPSTREAM=${sub_upstream}" \
+                "SUB_PROXY_PORT=${sub_proxy_port}"; then
+                rm -rf "$sub_proxy_bak"
+                exit 1
+            fi
+            write_sub_proxy_unit
             systemctl daemon-reload
             systemctl restart sub-proxy
             sleep 2
             if systemctl is-active --quiet sub-proxy; then
-                log_ok "Sub-proxy updated"
+                log_ok "Sub-proxy updated (links in $SUB_PROXY_ENV, mode 0600)"
+                rm -rf "$sub_proxy_bak"
+                # Backups of pre-v1.13.1 units sit world-readable next to the unit,
+                # with the links (exit UUID) inside. Regenerable — drop them.
+                if compgen -G "${SUB_PROXY_UNIT}.bak.*" >/dev/null; then
+                    rm -f "${SUB_PROXY_UNIT}".bak.*
+                    log_info "Removed old sub-proxy.service backups (they exposed links to all users)"
+                fi
             else
                 log_warn "Sub-proxy failed to start, restoring backup..."
-                cp "$sub_proxy_backup" "$sub_proxy_service"
+                cp -p "$sub_proxy_bak/unit" "$SUB_PROXY_UNIT"
+                if [[ "$had_env" == true ]]; then
+                    cp -p "$sub_proxy_bak/env" "$SUB_PROXY_ENV"
+                else
+                    rm -f "$SUB_PROXY_ENV"
+                fi
+                rm -rf "$sub_proxy_bak"
                 systemctl daemon-reload
                 systemctl restart sub-proxy || true
                 if systemctl is-active --quiet sub-proxy; then
@@ -478,19 +512,30 @@ SVCEOF
     # --- Step 6: Security ---
     log_info "=== Security ==="
     local ssh_port
-    ssh_port=$(grep -E '^Port ' /etc/ssh/sshd_config 2>/dev/null | head -1 | awk '{print $2}') || true
-    ssh_port="${ssh_port:-22}"
+    ssh_port=$(detect_ssh_port)
     log_info "Current SSH port: $ssh_port"
 
     local security_args=()
     [[ "$skip_ssh" == true ]] && security_args+=("--skip-ssh")
-    security_args+=(--ssh-port "$ssh_port" "$ssh_port":SSH 443:XRAY "$panel_port:3X-UI Panel")
+    security_args+=(--soft-ssh --ssh-port "$ssh_port" "$ssh_port":SSH 443:XRAY)
     if [[ "$is_selfsteal" == true ]]; then
+        # Panel/subscription go through Caddy only — not opened, and the rules older
+        # versions added are removed below (issue #40).
         security_args+=(80:Caddy-ACME)
-    elif [[ -n "$sub_port" ]]; then
-        security_args+=("$sub_port:Subscription")
+    else
+        if [[ -n "$panel_port" ]]; then
+            security_args+=("$panel_port:3X-UI Panel")
+        fi
+        if [[ -n "$sub_port" ]]; then
+            security_args+=("$sub_port:Subscription")
+        fi
     fi
     setup_security "${security_args[@]}"
+    if [[ "$is_selfsteal" == true ]]; then
+        # subPort only when Caddy proxies the subscription; otherwise an admin rule
+        # for IP:subPort may be the only way subscriptions are served.
+        close_xui_ufw_ports "$ssh_port" "$panel_port" "$sub_close_port"
+    fi
 
     # Install vpn CLI symlink (issue #23) — идемпотентно для существующих серверов
     install_vpn_cli_symlink "$SCRIPT_DIR/vpn"
@@ -512,7 +557,11 @@ SVCEOF
     if [[ "$upgrade" == true ]]; then
         echo "  3X-UI upgraded to latest version"
     fi
-    echo "  Security re-applied"
+    if [[ "${SSH_HARDENING_SKIPPED:-false}" == true ]]; then
+        log_warn "  Security re-applied WITHOUT SSH hardening — another sshd_config.d file overrides it (see the error above)"
+    else
+        echo "  Security re-applied"
+    fi
     echo "  Clients and subscriptions preserved"
     if [[ "$is_cdn" == true ]]; then
         echo "  CDN fallback inbound preserved"
@@ -528,5 +577,7 @@ SVCEOF
 }
 
 LOG_FILE="/var/log/vpn-setup-$(basename "$0" .sh)-$(date +%Y%m%d-%H%M%S).log"
+# Root-only: the log carries installer output (panel credentials, API token).
+install -m 0600 /dev/null "$LOG_FILE"
 main "$@" 2>&1 | tee "$LOG_FILE"
 exit "${PIPESTATUS[0]}"

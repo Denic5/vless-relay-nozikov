@@ -19,11 +19,10 @@ XUI_DB="/etc/x-ui/x-ui.db"
 run_selfcheck_exit() {
     local -n _fails="$1"
     local -n _warns="$2"
-    local rc
+    local rc hy_listen hy_port
 
     log_info "=== Block 1 — local services ==="
-    verify_service_running xray "XRAY"           || _fails=$((_fails + 1))
-    verify_service_running x-ui "3X-UI"          || _fails=$((_fails + 1))
+    verify_service_running xray "XRAY"         || _fails=$((_fails + 1))
     verify_port_listening 443 "XRAY"             || _fails=$((_fails + 1))
 
     if [[ -d /etc/caddy ]]; then
@@ -33,6 +32,16 @@ run_selfcheck_exit() {
 
     if [[ -f /etc/hysteria/config.yaml ]]; then
         verify_service_running hysteria-server "Hysteria 2" || _fails=$((_fails + 1))
+        # listen: ":PORT" or ":PORT-PORT_END" (port hopping) — check the first port.
+        hy_listen=$(awk '/^listen:/ {print $2; exit}' /etc/hysteria/config.yaml 2>/dev/null) || true
+        hy_port="${hy_listen##*:}"
+        hy_port="${hy_port%%-*}"
+        if [[ "$hy_port" =~ ^[0-9]+$ ]]; then
+            verify_port_listening "$hy_port" "Hysteria 2" udp || _fails=$((_fails + 1))
+        else
+            log_warn "Cannot parse Hysteria listen port from /etc/hysteria/config.yaml"
+            _warns=$((_warns + 1))
+        fi
     fi
 
     if command -v warp-cli &>/dev/null && \
@@ -91,6 +100,44 @@ run_selfcheck_exit() {
     fi
 }
 
+# SelfSteal relay (#40, #61): the panel — and the subscription server when a sub
+# domain is set (Caddy proxies it) — must listen on 127.0.0.1 only. A setting
+# changed in the web UI (or a panel upgrade) can bind them to the public IP again.
+# Checks both the DB value and the live socket. 0 = OK / not SelfSteal, 1 = WARN.
+check_xui_loopback() {
+    local dest sub_domain rc=0 what listen_key port_key listen port addrs addr
+    [[ -f "$XUI_DB" ]] || return 0
+    dest=$(sqlite3 "$XUI_DB" <<< "SELECT stream_settings FROM inbounds WHERE tag='inbound-443';" 2>/dev/null \
+        | jq -r '.realitySettings.dest // empty' 2>/dev/null) || dest=""
+    [[ "$dest" == *caddy.sock* ]] || return 0
+    sub_domain=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='subDomain';" 2>/dev/null) || sub_domain=""
+
+    for what in panel sub; do
+        if [[ "$what" == panel ]]; then
+            listen_key=webListen; port_key=webPort
+        else
+            [[ -n "$sub_domain" ]] || continue
+            listen_key=subListen; port_key=subPort
+        fi
+        listen=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='${listen_key}';" 2>/dev/null) || listen=""
+        port=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='${port_key}';" 2>/dev/null) || port=""
+        if [[ "$listen" != "127.0.0.1" ]]; then
+            log_warn "3X-UI ${listen_key}='${listen}' (expected 127.0.0.1 in SelfSteal) — re-bind: ./setup.sh update-relay"
+            rc=1
+        fi
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        addrs=$(ss -tlnH "sport = :${port}" 2>/dev/null | awk '{print $4}') || addrs=""
+        for addr in $addrs; do
+            if [[ "$addr" != "127.0.0.1:${port}" && "$addr" != "[::1]:${port}" ]]; then
+                log_warn "3X-UI ${what} port ${port} listens on ${addr} (public) — re-bind: ./setup.sh update-relay"
+                rc=1
+            fi
+        done
+    done
+    [[ "$rc" -eq 0 ]] && log_ok "3X-UI panel/subscription bound to 127.0.0.1 (SelfSteal)"
+    return "$rc"
+}
+
 # shellcheck disable=SC2178
 run_selfcheck_relay() {
     local -n _fails="$1"
@@ -99,6 +146,7 @@ run_selfcheck_relay() {
 
     log_info "=== Block 1 — local services ==="
     verify_service_running x-ui "3X-UI"           || _fails=$((_fails + 1))
+    check_xui_version update-relay                || _warns=$((_warns + 1))
     verify_port_listening 443 "XRAY (3X-UI)"      || _fails=$((_fails + 1))
 
     if [[ -d /etc/caddy ]]; then
@@ -109,6 +157,7 @@ run_selfcheck_relay() {
     if [[ -f /etc/systemd/system/sub-proxy.service ]]; then
         verify_service_running sub-proxy "Sub-proxy" || _fails=$((_fails + 1))
     fi
+    check_xui_loopback                            || _warns=$((_warns + 1))
 
     log_info "=== Block 2 — system resources ==="
     rc=0; check_disk_space || rc=$?
@@ -121,7 +170,7 @@ run_selfcheck_relay() {
     local domain=""
     if [[ -f "$XUI_DB" ]]; then
         domain=$(sqlite3 "$XUI_DB" \
-            "SELECT stream_settings FROM inbounds WHERE tag='inbound-443';" 2>/dev/null | \
+            <<< "SELECT stream_settings FROM inbounds WHERE tag='inbound-443';" 2>/dev/null | \
             jq -r '.realitySettings.serverNames[0] // empty' 2>/dev/null) || true
         if [[ -n "$domain" && "$domain" != "null" ]]; then
             rc=0; check_cert_expiry "$domain" || rc=$?

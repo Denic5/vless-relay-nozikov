@@ -9,6 +9,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROJECT_VERSION=$(cat "$REPO_ROOT/VERSION" 2>/dev/null || echo "unknown")
 
+# Pinned 3X-UI release (relay; exit has no panel since v1.13.0). install.sh is pulled from the SAME tag (not
+# master), so the installer behaviour in lib/3xui.sh is the one verified against.
+# v3.11.0 is the first release that closes all published advisories against v3.x
+# (issue #53). Lives here, not in 3xui.sh, so selfcheck can compare against it.
+XUI_VERSION="v3.11.0"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -76,6 +82,32 @@ validate_ip() {
     [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
+# Returns 0 if the IPv4 literal is in a range xray-core's freedom outbound blocks
+# by default since 26.10 (geodata.GetPrivateIPMatcher, IPv4 part): RFC1918,
+# CGNAT 100.64/10, loopback, link-local, benchmarking, documentation, multicast,
+# reserved. Non-IPv4 input (domain, IPv6) → 1.
+is_private_ipv4() {
+    local ip="$1" a b c d n
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+    c=$((10#${BASH_REMATCH[3]})); d=$((10#${BASH_REMATCH[4]}))
+    (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || return 1
+    n=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+    # base/prefix pairs
+    local range base prefix mask
+    for range in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
+                 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.52.193.0/24 \
+                 192.88.99.2/32 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 \
+                 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4; do
+        prefix="${range#*/}"
+        IFS=. read -r a b c d <<< "${range%/*}"
+        base=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+        (( (n & mask) == base )) && return 0
+    done
+    return 1
+}
+
 validate_uuid() {
     local uuid="$1"
     [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
@@ -90,13 +122,90 @@ validate_not_empty() {
     fi
 }
 
+# Secrets never go on a child's argv — /proc/*/cmdline is world-readable (ps).
+# bash builtins (printf) don't exec, so `printf '%s' "$secret" | cmd`, jq
+# `--rawfile k <(printf '%s' "$v")` and `sqlite3 "$db" <<< "$sql"` are safe.
+
+# URL-encode a string (urllib.parse.quote, safe='/'), input via stdin.
+url_quote() {
+    printf '%s' "$1" | python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read()))'
+}
+
+# Reality public key from the base64url private key, without `xray x25519 -i KEY`
+# (argv). Wraps the raw 32-byte X25519 key in a PKCS#8 DER header for openssl.
+# Prints nothing on failure (empty/garbled key, openssl < 1.1.0) — no fallback
+# to xray: that puts the key on argv, and `xray x25519 -i ""` makes a NEW pair.
+reality_public_key_from_private() {
+    local b64="${1//-/+}" pub=""
+    b64="${b64//_//}"
+    while (( ${#b64} % 4 )); do b64+="="; done
+    pub=$({ printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20'
+            printf '%s' "$b64" | openssl base64 -d -A; } 2>/dev/null \
+        | openssl pkey -inform DER -pubout -outform DER 2>/dev/null \
+        | tail -c 32 | openssl base64 -A | tr '+/' '-_' | tr -d '=') || pub=""
+    [[ ${#pub} -eq 43 ]] || pub=""
+    printf '%s' "$pub"
+}
+
+# Keep the newest KEEP timestamped backups "<prefix><YYYYmmdd-HHMMSS>" (glob order
+# is lexical = chronological), delete older ones together with their
+# "<backup>.api-token" sibling (update-relay). Call only after the run succeeded,
+# so the current rollback target is never pruned.
+prune_backups() {
+    local prefix="$1" keep="${2:-5}" f n i
+    local all=()
+    for f in "${prefix}"*; do
+        [[ -f "$f" && "$f" != *.api-token ]] || continue
+        all+=("$f")
+    done
+    n=$(( ${#all[@]} - keep ))
+    (( n > 0 )) || return 0
+    for (( i = 0; i < n; i++ )); do
+        rm -f "${all[i]}" "${all[i]}.api-token"
+    done
+    log_info "Removed ${n} old backup(s) ${prefix}* (kept ${keep})"
+}
+
+# acme.sh leftovers of 3X-UI's installer (exit ≤v1.12, old relays): a short-lived
+# LE cert for the server IP, used only by the panel, plus the daily acme.sh cron.
+# Call once the panel is gone. Drops IP-named certs (acme.sh dirs, /root/cert/ip);
+# the cron goes only if acme.sh manages no other cert — a domain cert (plain relay,
+# issue_domain_cert) keeps renewing. --purge-certs in uninstall removes everything.
+cleanup_acme_panel_leftovers() {
+    local acme_home="/root/.acme.sh" d name removed=0 left=0
+    rm -rf /root/cert/ip
+    [[ -f "$acme_home/acme.sh" ]] || return 0
+    for d in "$acme_home"/*/; do
+        [[ -d "$d" ]] || continue
+        name=$(basename "$d"); name="${name%_ecc}"
+        [[ -f "${d}${name}.conf" ]] || continue
+        if [[ "$name" =~ ^[0-9.]+$ || "$name" == *:* ]]; then
+            rm -rf "$d"
+            removed=$((removed + 1))
+        else
+            left=$((left + 1))
+        fi
+    done
+    (( removed > 0 )) && log_ok "Removed ${removed} acme.sh IP cert(s) of the 3X-UI panel"
+    local cron=""
+    cron=$(crontab -l 2>/dev/null) || cron=""
+    if (( left == 0 )) && [[ "$cron" == *"acme.sh --cron"* ]]; then
+        if "$acme_home/acme.sh" --uninstall-cronjob > /dev/null 2>&1; then
+            log_ok "Disabled acme.sh cron (no certificates left to renew)"
+        else
+            log_warn "acme.sh --uninstall-cronjob failed; remove the cron entry manually (crontab -e)"
+        fi
+    fi
+    return 0
+}
+
 generate_random_port() {
     local excluded_ports=("$@")
     local port
     while true; do
         port=$(shuf -i 10000-60000 -n 1)
         # Skip if port is already listening
-        if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+        if [[ -n "$(ss -tlnH "sport = :${port}" 2>/dev/null)" ]]; then
             continue
         fi
         # Skip if in excluded list
@@ -223,17 +332,82 @@ LIMITS
     log_ok "systemd nofile limit set to 65535 (applies on next service start)"
 }
 
+# On a freshly booted VM unattended-upgrades holds the dpkg lock for minutes and
+# apt-get fails immediately with exit 100. Make apt wait for the lock instead.
+# Idempotent; called before every apt run in update_system/install_dependencies.
+configure_apt_lock_timeout() {
+    local conf=/etc/apt/apt.conf.d/99-vpn-lock-timeout
+    if [[ -f "$conf" ]] && grep -q 'DPkg::Lock::Timeout "300";' "$conf"; then
+        return 0
+    fi
+    mkdir -p /etc/apt/apt.conf.d
+    echo 'DPkg::Lock::Timeout "300";' > "$conf"
+    log_ok "apt dpkg lock timeout set to 300s"
+}
+
+# `apt-get update` with retries. DPkg::Lock::Timeout only covers the dpkg frontend
+# lock; the lists lock (/var/lib/apt/lists/lock), held by apt-daily on a VM's first
+# boot, still fails `apt-get update` immediately. Lock errors are retried up to
+# 30 × 10s (~5 min); any other error (broken third-party repo, NO_PUBKEY, mirror
+# outage) gets only 3 attempts so it fails fast with apt's output. Use this for
+# EVERY `apt-get update` in scripts/. Returns 1 on failure (callers run under set -e).
+apt_update_retry() {
+    local attempt max_attempts=30 other_failures=0 max_other=3 out
+    configure_apt_lock_timeout
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        if out=$(apt-get update -qq 2>&1); then
+            return 0
+        fi
+        if grep -qiE 'could not get lock|lists/lock|is held by process' <<< "$out"; then
+            log_warn "apt lists lock is held (apt-daily?) — retrying in 10s (attempt ${attempt}/${max_attempts})"
+        else
+            other_failures=$((other_failures + 1))
+            if ((other_failures >= max_other)); then
+                printf '%s\n' "$out" >&2
+                log_error "apt-get update failed ${other_failures} times (not a lock error)"
+                return 1
+            fi
+            log_warn "apt-get update failed (attempt ${other_failures}/${max_other}) — retrying in 10s"
+        fi
+        ((attempt < max_attempts)) && sleep 10
+    done
+    printf '%s\n' "$out" >&2
+    log_error "apt-get update still blocked by the lists lock after ${max_attempts} attempts"
+    return 1
+}
+
 install_dependencies() {
     log_info "Installing dependencies..."
-    apt-get update -qq
+    apt_update_retry || return 1
     apt-get install -y -qq curl wget unzip jq openssl cron socat git sqlite3 > /dev/null 2>&1
     log_ok "Dependencies installed"
 }
 
 update_system() {
+    local out
     log_info "Updating system..."
-    apt-get update -qq && apt-get upgrade -y -qq > /dev/null 2>&1
+    # Separate statements, not `update && upgrade`: set -e ignores a failure in a
+    # non-final element of an && list, which used to end in "System updated".
+    apt_update_retry || return 1
+    if ! out=$(apt-get upgrade -y -qq 2>&1); then
+        printf '%s\n' "$out" | tail -n 20
+        log_error "apt-get upgrade failed — fix apt (see above), then re-run"
+        return 1
+    fi
     log_ok "System updated"
+}
+
+# Print the installed 3X-UI panel version without a leading "v" (e.g. "3.11.0"), or
+# nothing if the binary is missing / prints no version. `x-ui -v` on the BINARY
+# (not the /usr/bin/x-ui menu script) prints config.GetPanelVersion(): the bare
+# version, or "dev+<commit>" for dev builds.
+xui_installed_version() {
+    local bin="${XUI_MAIN_FOLDER:-/usr/local/x-ui}/x-ui" out=""
+    [[ -x "$bin" ]] || return 0
+    out=$("$bin" -v 2>/dev/null) || true
+    if [[ "$out" =~ (dev\+[0-9a-zA-Z]+|v?[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*) ]]; then
+        printf '%s' "${BASH_REMATCH[1]#v}"
+    fi
 }
 
 validate_domain() {

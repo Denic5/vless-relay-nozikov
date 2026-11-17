@@ -167,12 +167,7 @@ main() {
     # --- Step 5: Install and configure 3X-UI ---
     log_info "=== 3X-UI Setup ==="
 
-    if [[ -n "$selfsteal_domain" ]]; then
-        install_3xui true  # skip port 80 cleanup — Caddy needs it
-    else
-        install_3xui
-    fi
-
+    install_3xui
     configure_3xui "$panel_port" "$panel_path" "$admin_user" "$admin_pass"
 
     # Configure subscription + SelfSteal-specific settings
@@ -181,8 +176,13 @@ main() {
     if [[ -n "$selfsteal_domain" ]]; then
         x-ui stop
 
-        # Bind panel to localhost (Caddy proxies external access)
-        xui_db_set "webListen" "127.0.0.1"
+        # Bind panel + subscription server to localhost: reachable only through
+        # Caddy (issue #40); their ports are never opened in UFW in SelfSteal.
+        if [[ -n "$sub_domain" ]]; then
+            xui_bind_loopback with-sub
+        else
+            xui_bind_loopback
+        fi
         # Clear panel cert — guarantees plain HTTP to Caddy reverse proxy
         # regardless of whether sub_domain is set, and even if the 3X-UI
         # installer sets an IP cert on future versions
@@ -197,7 +197,6 @@ main() {
             xui_db_set "subPort" "$sub_port"
             xui_db_set "subPath" "/$sub_path/"
             xui_db_set "subDomain" "$sub_domain"
-            xui_db_set "subListen" "127.0.0.1"
             xui_db_set "subURI" "https://${sub_domain}/${sub_path}/"
             # Clear certs set by 3X-UI installer — Caddy handles TLS termination,
             # subscription must listen on plain HTTP for Caddy reverse proxy to work
@@ -224,10 +223,10 @@ main() {
                 local download_extra extra_encoded
                 download_extra=$(jq -n -c \
                     --arg padding "100-1000" \
-                    --arg exit_addr "$exit_ip" \
-                    --arg exit_sni_val "$exit_sni" \
-                    --arg exit_pubkey_val "$exit_pubkey" \
-                    --arg exit_short_id_val "$exit_short_id" \
+                    --rawfile exit_addr <(printf '%s' "$exit_ip") \
+                    --rawfile exit_sni_val <(printf '%s' "$exit_sni") \
+                    --rawfile exit_pubkey_val <(printf '%s' "$exit_pubkey") \
+                    --rawfile exit_short_id_val <(printf '%s' "$exit_short_id") \
                     '{
                         xPaddingBytes: $padding,
                         downloadSettings: {
@@ -245,7 +244,7 @@ main() {
                             }
                         }
                     }')
-                extra_encoded=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$download_extra")
+                extra_encoded=$(url_quote "$download_extra")
                 cdn_vless_link_asym="vless://${exit_uuid}@${cdn_domain}:443?type=xhttp&security=tls&sni=${cdn_domain}&host=${cdn_domain}&path=%2F${cdn_path}&mode=packet-up&extra=${extra_encoded}#CDN%20Asymmetric"
             fi
 
@@ -263,7 +262,7 @@ main() {
             # since 3X-UI's built-in subscription generator does not emit extra=.
             local relay_extra_json relay_extra_encoded
             relay_extra_json=$(xhttp_extra_json)
-            relay_extra_encoded=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$relay_extra_json")
+            relay_extra_encoded=$(url_quote "$relay_extra_json")
 
             sub_proxy_port=$((sub_port + 1))
             setup_sub_proxy "$sub_port" "$cdn_vless_link" "$sub_proxy_port" "$cdn_domain" "$cdn_path" "$cdn_vless_link_asym" "$direct_vless_link" "$hysteria_link" "$hysteria_port" "$hysteria_port_end" "$hysteria_obfs" "$relay_extra_encoded"
@@ -290,7 +289,8 @@ main() {
 
     # Create relay inbound and xray template (all DB writes)
     local default_sub_id
-    default_sub_id=$(head -c 8 /dev/urandom | xxd -p)
+    # od (coreutils) instead of xxd — xxd is absent on minimal images (issue #55)
+    default_sub_id=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
     local relay_xhttp_path
     relay_xhttp_path=$(generate_random_path)
 
@@ -337,6 +337,10 @@ main() {
         security_args+=("$sub_port:Subscription")
     fi
     setup_security "${security_args[@]}"
+    if [[ -n "$selfsteal_domain" ]]; then
+        # --force over an older install: drop panel rules it may have left open
+        close_xui_ufw_ports "$ssh_port" "$panel_port"
+    fi
 
     # Install vpn CLI symlink (issue #23)
     install_vpn_cli_symlink "$SCRIPT_DIR/vpn"

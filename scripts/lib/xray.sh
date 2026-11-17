@@ -141,7 +141,7 @@ XRAYEOF
         cdn_extra_json=$(xhttp_extra_json)
         if ! tmp_config=$(jq \
             --argjson cdn_port "$cdn_port" \
-            --arg cdn_path "$cdn_path" \
+            --rawfile cdn_path <(printf '%s' "$cdn_path") \
             --argjson extra "$cdn_extra_json" \
             '.inbounds += [{
                 tag: "vless-cdn-in",
@@ -211,6 +211,21 @@ disable_system_xray() {
     log_ok "System xray disabled (binary kept for key generation)"
 }
 
+# `xray -test` runs as root and creates missing log files as root:root 0600.
+# The service runs unprivileged (Xray-install: User=xray in current releases,
+# nobody before) and then dies with "open /var/log/xray/access.log: permission
+# denied". Current install-release.sh no longer pre-creates the files, so a
+# fresh exit hits this on its first restart.
+fix_xray_log_perms() {
+    local svc_user
+    svc_user=$(systemctl show -p User --value xray 2>/dev/null || true)
+    [[ -z "$svc_user" || "$svc_user" == "root" ]] && return 0
+    id "$svc_user" &>/dev/null || return 0
+    mkdir -p /var/log/xray
+    touch /var/log/xray/access.log /var/log/xray/error.log
+    chown -R "${svc_user}:" /var/log/xray
+}
+
 restart_xray() {
     # Validate config before restart — catches schema errors (e.g., binary too old
     # for limitFallback) explicitly instead of leaving xray in a failed state.
@@ -219,6 +234,7 @@ restart_xray() {
         xray -test -config /usr/local/etc/xray/config.json || true
         return 1
     fi
+    fix_xray_log_perms
 
     systemctl restart xray
     systemctl enable xray

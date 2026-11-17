@@ -47,22 +47,34 @@ require_relay() {
 
 # Читает subURI из 3X-UI или конструирует из subDomain/subPort/subPath.
 # Если ничего не сконфигурировано — отказ (без curl на ifconfig.me).
+# stdout вызывающий забирает в $(...) — тут не логируем; без подписки молча
+# return 1, подсказку печатает вызывающий (print_no_subscription_hint, stderr).
 get_subscription_prefix() {
     local sub_uri sub_domain sub_port sub_path
-    sub_uri=$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='subURI';" 2>/dev/null) || true
+    sub_uri=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='subURI';" 2>/dev/null) || true
     if [[ -n "$sub_uri" ]]; then
         echo "$sub_uri"
         return 0
     fi
-    sub_domain=$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='subDomain';" 2>/dev/null) || true
-    sub_port=$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='subPort';" 2>/dev/null) || true
-    sub_path=$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='subPath';" 2>/dev/null) || true
+    sub_domain=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='subDomain';" 2>/dev/null) || true
+    sub_port=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='subPort';" 2>/dev/null) || true
+    sub_path=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='subPath';" 2>/dev/null) || true
     if [[ -n "$sub_domain" && -n "$sub_port" ]]; then
         echo "https://${sub_domain}:${sub_port}${sub_path:-/}"
         return 0
     fi
-    log_error "Cannot determine subscription URL — set 3X-UI subscription settings (subURI/subDomain/subPort)"
     return 1
+}
+
+# Подсказка для relay без подписки (setup-relay без домена её не включает). stderr.
+print_no_subscription_hint() {
+    {
+        log_info "Subscription is not configured on this relay (no subURI / subDomain+subPort in 3X-UI settings)."
+        log_info "Subscriptions need a domain pointing to this relay. To enable:"
+        log_info "  - 3X-UI panel: Settings → Subscription → enable, set Domain + Port (+ TLS cert)"
+        log_info "  - or reinstall the relay with a domain: ./setup.sh relay --force"
+        log_info "Until then take the client's VLESS link/QR from the panel: Inbounds → inbound-443 → client."
+    } >&2
 }
 
 # Health check — ждём что xray забиндил :443 и процесс xray жив.
@@ -73,7 +85,7 @@ wait_xray_listening() {
     # (он только в working dir /usr/local/x-ui). Поэтому матчим бинарник.
     local _i
     for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-        if ss -tln 2>/dev/null | grep -qE ':443\s' \
+        if [[ -n "$(ss -tlnH 'sport = :443' 2>/dev/null)" ]] \
            && pgrep -af 'xray.*-c' > /dev/null 2>&1; then
             return 0
         fi
@@ -92,7 +104,7 @@ cmd_add() {
 
     # Uniqueness — read clients via API (normalized source of truth on v3).
     local existing
-    existing=$(xui_api_list_clients | jq -r --arg n "$name" 'first(.[]?|select(.email==$n).email) // empty') || true
+    existing=$(xui_api_list_clients | jq -r --rawfile n <(printf '%s' "$name") 'first(.[]?|select(.email==$n).email) // empty') || true
     if [[ -n "$existing" ]]; then
         log_error "Client '$name' already exists"
         exit 1
@@ -107,7 +119,7 @@ cmd_add() {
     log_info "Adding client '$name' (UUID: $uuid)"
 
     local client_json
-    client_json=$(jq -n -c --arg id "$uuid" --arg n "$name" --arg s "$sub_id" \
+    client_json=$(jq -n -c --rawfile id <(printf '%s' "$uuid") --rawfile n <(printf '%s' "$name") --rawfile s <(printf '%s' "$sub_id") \
         '{id:$id, email:$n, flow:"", limitIp:0, totalGB:0, expiryTime:0, enable:true, subId:$s, tgId:0, reset:0, comment:""}')
     xui_api_add_client "$inbound_id" "$client_json" || { log_error "Failed to add client via API"; exit 2; }
 
@@ -119,41 +131,60 @@ cmd_add() {
     # CDN sync — idempotent, non-fatal.
     sync_cdn_clients || log_warn "CDN sync failed (non-fatal) — re-run 'vpn add' or 'update-relay' to retry"
 
-    local prefix link
-    prefix=$(get_subscription_prefix)
-    link="${prefix}${sub_id}"
     log_ok "Added client '$name' (UUID: $uuid)"
+
+    # Client is already created — a missing subscription is a warning, not a failure.
+    local prefix
+    if ! prefix=$(get_subscription_prefix); then
+        log_warn "No subscription link for '$name' — client was added anyway" >&2
+        print_no_subscription_hint
+        return 0
+    fi
     echo ""
-    echo "Subscription: $link"
+    echo "Subscription: ${prefix}${sub_id}"
 }
 
 cmd_list() {
     local rows
     rows=$(sqlite3 -separator $'\t' "$XUI_DB" \
-        "SELECT email, uuid, enable FROM clients ORDER BY email;" 2>/dev/null) || {
+        <<< "SELECT email, uuid, enable FROM clients ORDER BY email;" 2>/dev/null) || {
             log_error "Cannot read clients from $XUI_DB"; exit 1; }
     if [[ -z "$rows" ]]; then
         echo "No clients."
         return
     fi
-    {
-        printf 'NAME\tUUID\tENABLE\tUP\tDOWN\n'
-        while IFS=$'\t' read -r email uuid enable; do
-            [[ -z "$email" ]] && continue
-            local traffic up=0 down=0 up_h down_h en="no"
-            [[ "$enable" == "1" ]] && en="yes"
-            traffic=$(sqlite3 -separator $'\t' "$XUI_DB" \
-                "SELECT up, down FROM client_traffics WHERE email='${email//\'/\'\'}';" 2>/dev/null) || true
-            if [[ -n "$traffic" ]]; then
-                up=$(printf '%s' "$traffic" | cut -f1); down=$(printf '%s' "$traffic" | cut -f2)
-            fi
-            [[ "$up" =~ ^[0-9]+$ ]] || up=0
-            [[ "$down" =~ ^[0-9]+$ ]] || down=0
-            up_h=$(numfmt --to=iec --suffix=B "$up" 2>/dev/null || echo "${up}B")
-            down_h=$(numfmt --to=iec --suffix=B "$down" 2>/dev/null || echo "${down}B")
-            printf '%s\t%s\t%s\t%s\t%s\n' "$email" "$uuid" "$en" "$up_h" "$down_h"
-        done <<< "$rows"
-    } | column -t -s$'\t'
+    # Collect cells first, then align with printf — `column` (bsdextrautils) is
+    # absent on minimal Ubuntu 24.04 images (issue #59).
+    local -a c_name=(NAME) c_uuid=(UUID) c_en=(ENABLE) c_up=(UP) c_down=(DOWN)
+    local email uuid enable traffic up down en
+    while IFS=$'\t' read -r email uuid enable; do
+        [[ -z "$email" ]] && continue
+        up=0; down=0; en="no"
+        [[ "$enable" == "1" ]] && en="yes"
+        traffic=$(sqlite3 -separator $'\t' "$XUI_DB" \
+            <<< "SELECT up, down FROM client_traffics WHERE email='${email//\'/\'\'}';" 2>/dev/null) || true
+        if [[ -n "$traffic" ]]; then
+            up="${traffic%%$'\t'*}"; down="${traffic#*$'\t'}"
+        fi
+        [[ "$up" =~ ^[0-9]+$ ]] || up=0
+        [[ "$down" =~ ^[0-9]+$ ]] || down=0
+        c_name+=("$email"); c_uuid+=("$uuid"); c_en+=("$en")
+        c_up+=("$(numfmt --to=iec --suffix=B "$up" 2>/dev/null || echo "${up}B")")
+        c_down+=("$(numfmt --to=iec --suffix=B "$down" 2>/dev/null || echo "${down}B")")
+    done <<< "$rows"
+
+    local i w_name=0 w_uuid=0 w_en=0 w_up=0
+    for i in "${!c_name[@]}"; do
+        (( ${#c_name[i]} > w_name )) && w_name=${#c_name[i]}
+        (( ${#c_uuid[i]} > w_uuid )) && w_uuid=${#c_uuid[i]}
+        (( ${#c_en[i]} > w_en )) && w_en=${#c_en[i]}
+        (( ${#c_up[i]} > w_up )) && w_up=${#c_up[i]}
+    done
+    for i in "${!c_name[@]}"; do
+        printf '%-*s  %-*s  %-*s  %-*s  %s\n' \
+            "$w_name" "${c_name[i]}" "$w_uuid" "${c_uuid[i]}" \
+            "$w_en" "${c_en[i]}" "$w_up" "${c_up[i]}" "${c_down[i]}"
+    done
 }
 
 cmd_link() {
@@ -161,13 +192,17 @@ cmd_link() {
     if [[ -z "$name" ]]; then log_error "Usage: vpn link <name>"; exit 1; fi
     local sub_id
     sub_id=$(sqlite3 "$XUI_DB" \
-        "SELECT sub_id FROM clients WHERE email='${name//\'/\'\'}' LIMIT 1;" 2>/dev/null) || true
+        <<< "SELECT sub_id FROM clients WHERE email='${name//\'/\'\'}' LIMIT 1;" 2>/dev/null) || true
     if [[ -z "$sub_id" ]]; then
         log_error "Client '$name' not found"
         exit 1
     fi
     local prefix
-    prefix=$(get_subscription_prefix)
+    if ! prefix=$(get_subscription_prefix); then
+        log_error "Cannot build a subscription link for '$name'" >&2
+        print_no_subscription_hint
+        exit 1
+    fi
     echo "${prefix}${sub_id}"
 }
 
@@ -188,7 +223,7 @@ cmd_remove() {
     fi
 
     local found
-    found=$(xui_api_list_clients | jq -r --arg n "$name" 'first(.[]?|select(.email==$n).email) // empty') || true
+    found=$(xui_api_list_clients | jq -r --rawfile n <(printf '%s' "$name") 'first(.[]?|select(.email==$n).email) // empty') || true
     if [[ -z "$found" ]]; then
         log_error "Client '$name' not found"
         exit 1

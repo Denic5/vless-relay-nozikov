@@ -30,7 +30,7 @@ confirm_uninstall() {
 
     echo ""
     log_warn "This will remove ALL VPN components from this server:"
-    echo "  - 3X-UI panel and database"
+    echo "  - 3X-UI panel and database (relay; legacy exit installs)"
     echo "  - XRAY core"
     echo "  - fail2ban"
     echo "  - UFW firewall rules"
@@ -61,6 +61,7 @@ uninstall_3xui() {
     fi
 
     rm -rf /etc/x-ui/ 2>/dev/null || true
+    rm -rf /var/log/x-ui/ 2>/dev/null || true
     rm -rf /etc/vpn-cli/ 2>/dev/null || true
 }
 
@@ -79,15 +80,17 @@ uninstall_xray() {
 }
 
 uninstall_acme() {
-    if [[ -f ~/.acme.sh/acme.sh ]]; then
+    if [[ -f /root/.acme.sh/acme.sh ]]; then
         if [[ "$PURGE_CERTS" == true ]]; then
             log_info "Removing acme.sh and certificates..."
-            ~/.acme.sh/acme.sh --uninstall 2>/dev/null || true
-            rm -rf ~/.acme.sh 2>/dev/null || true
+            /root/.acme.sh/acme.sh --uninstall 2>/dev/null || true
+            rm -rf /root/.acme.sh 2>/dev/null || true
             rm -rf /root/cert/ 2>/dev/null || true
             log_ok "acme.sh and certificates removed"
         else
-            log_info "acme.sh and certs preserved (use --purge-certs to remove)"
+            # The panel is gone — its IP cert and, if nothing else is left, the cron too
+            cleanup_acme_panel_leftovers
+            log_info "acme.sh and domain certs preserved (use --purge-certs to remove)"
         fi
     else
         log_info "acme.sh not found, skipping"
@@ -176,6 +179,11 @@ main() {
             userdel hysteria 2>/dev/null || true
             log_ok "Hysteria 2 removed"
         fi
+    fi
+    # sub-proxy: its env file holds links with the exit UUID — remove it even if
+    # Caddy is already gone (uninstall_caddy calls it too; idempotent)
+    if type uninstall_sub_proxy &>/dev/null && [[ -f /etc/systemd/system/sub-proxy.service || -d /etc/sub-proxy ]]; then
+        uninstall_sub_proxy
     fi
     # Caddy (SelfSteal)
     if type uninstall_caddy &>/dev/null; then

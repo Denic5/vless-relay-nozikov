@@ -3,6 +3,8 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/xui-api.sh"
+# close_xui_ufw_ports / ufw_close_tcp_port (purge_3xui_panel)
+source "$(dirname "${BASH_SOURCE[0]}")/security.sh"
 
 XUI_BIN="${XUI_MAIN_FOLDER:-/usr/local/x-ui}/x-ui"
 XUI_DB="/etc/x-ui/x-ui.db"
@@ -16,45 +18,250 @@ XUI_DB="/etc/x-ui/x-ui.db"
 # and 3xui.sh (relay) use the same values. This prevents mismatch between
 # relay outbound scMaxEachPostBytes and exit inbound cap.
 
-install_3xui() {
-    local skip_acme_port="${1:-false}"
+# XUI_VERSION (the pinned 3X-UI release) and xui_installed_version live in
+# common.sh — selfcheck compares against them without pulling in this module.
 
+# Run the pinned 3X-UI install.sh non-interactively. Same call for a fresh install
+# and for an upgrade of an already-configured panel (install.sh skips the
+# credentials/port setup when they're already set, then runs `x-ui migrate`).
+#
+# Verified against the v3.11.0 installer source: since v3.6.0 install.sh has a
+# non-interactive mode (XUI_NONINTERACTIVE=1, or any non-TTY stdin) where every
+# prompt is replaced by an env var or a default — the old answers-file feed is no
+# longer read at all. We set explicitly what we rely on:
+#   XUI_SSL_MODE=none          → Skip SSL; in NI mode "bind to 127.0.0.1?" is n.
+#                                (The interactive default is an LE IP cert via
+#                                acme.sh on :80, which collides with Caddy.)
+#   XUI_DB_TYPE=sqlite         → we read/write /etc/x-ui/x-ui.db directly.
+#   XUI_ENABLE_FAIL2BAN=false  → v3.11 otherwise runs `x-ui setup-fail2ban` (IP
+#                                Limit): installs nftables, drops jail.d files incl.
+#                                a global `backend = systemd` override and edits
+#                                jail.local. fail2ban is ours (security.sh); we
+#                                don't use IP Limit.
+#   XUI_SERVER_IP              → when none of install.sh's IP-echo providers answer,
+#                                NI mode takes this instead of looping on "Please
+#                                enter your server's public IPv4 address" (v3.1.0 +
+#                                answers file spun forever on EOF — issue #52). It
+#                                only feeds the printed access URL, so empty is fine;
+#                                our scripts don't detect the IP before install, the
+#                                operator may export it.
+# Panel port: XUI_PANEL_PORT unset → random port (same as before). `< /dev/null`
+# keeps stdin a non-TTY so it never falls back to prompting, even when setup.sh
+# runs in a terminal; on our path (SSL none, SQLite) every read in install.sh is
+# behind the NONINTERACTIVE guard.
+#
+# install.sh is downloaded to a temp file first (curl -f + retries + non-empty
+# check) instead of `bash <(curl -Ls …)`: that form ran an empty or HTML-error body
+# as a "successful" no-op install. After the run the binary's own version must equal
+# XUI_VERSION — otherwise we'd go on to write a DB the code wasn't verified against.
+run_3xui_installer() {
+    local tmp installed
+    local url="https://raw.githubusercontent.com/mhsanaei/3x-ui/${XUI_VERSION}/install.sh"
+
+    tmp=$(mktemp "${TMPDIR:-/tmp}/3x-ui-install.XXXXXX")
+    if ! curl -fsSL --retry 3 --retry-delay 2 -o "$tmp" "$url" || [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        log_error "Failed to download 3X-UI ${XUI_VERSION} installer: $url"
+        exit 1
+    fi
+
+    if ! XUI_NONINTERACTIVE=1 XUI_SSL_MODE=none XUI_DB_TYPE=sqlite XUI_ENABLE_FAIL2BAN=false \
+        XUI_SERVER_IP="${XUI_SERVER_IP:-}" \
+        bash "$tmp" "${XUI_VERSION}" < /dev/null; then
+        rm -f "$tmp" "$XUI_INSTALL_RESULT"
+        log_error "3X-UI ${XUI_VERSION} installer failed (see output above)"
+        exit 1
+    fi
+    rm -f "$tmp"
+    # install.sh writes the panel credentials + its "install" API token in plaintext
+    # here (for cloud-init/MOTD). We never read it; the token is revoked separately.
+    rm -f "$XUI_INSTALL_RESULT"
+
+    installed=$(xui_installed_version)
+    if [[ "$installed" != "${XUI_VERSION#v}" ]]; then
+        log_error "3X-UI version mismatch after install: expected ${XUI_VERSION#v}, binary reports '${installed:-none}'"
+        exit 1
+    fi
+    log_ok "3X-UI binary version ${installed} matches the pin"
+}
+
+# install.sh (v3.11) mints admin-scope API tokens for its own summary: "install" on a
+# panel with no tokens, "cli-fallback" (rotated) on a later `-getApiToken`, i.e. a
+# re-run that resets default credentials. Their plaintext goes to stdout — our tee'd
+# /var/log/vpn-setup-*.log — and to install-result.env. We never use them (the relay
+# has its own "vpn-cli" token), so they are pure exposure. Relay-only since v1.13.0.
+# Exact names from main.go (installTokenName / cliFallbackTokenName); tokens the
+# operator created in the panel are left alone.
+XUI_INSTALLER_TOKEN_NAMES="'install','cli-fallback'"
+XUI_INSTALL_RESULT="/etc/x-ui/install-result.env"
+
+# Prints how many installer tokens are in the DB (0 when there is no DB or no
+# api_tokens table). Read-only — safe while the panel runs.
+count_installer_api_tokens() {
+    local has_table n
+    [[ -f "$XUI_DB" ]] || { echo 0; return 0; }
+    has_table=$(sqlite3 "$XUI_DB" \
+        <<< "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='api_tokens';" 2>/dev/null) || has_table=0
+    if [[ "${has_table:-0}" -eq 0 ]]; then
+        echo 0
+        return 0
+    fi
+    n=$(sqlite3 "$XUI_DB" \
+        <<< "SELECT COUNT(*) FROM api_tokens WHERE name IN (${XUI_INSTALLER_TOKEN_NAMES});" 2>/dev/null) || n=0
+    echo "${n:-0}"
+}
+
+# Delete the installer tokens + install-result.env. Direct DB write, so it MUST run
+# inside an `x-ui stop` ... `x-ui start` window (a running panel flushes its
+# in-memory state over the DB on shutdown). Idempotent; quiet no-op without the table.
+revoke_installer_api_tokens() {
+    local n
+    rm -f "$XUI_INSTALL_RESULT"
+    n=$(count_installer_api_tokens)
+    if [[ "$n" -gt 0 ]]; then
+        sqlite3 "$XUI_DB" <<< "DELETE FROM api_tokens WHERE name IN (${XUI_INSTALLER_TOKEN_NAMES});"
+        log_info "Revoked ${n} installer-created API token(s) (install/cli-fallback)"
+    fi
+}
+
+# No UFW juggling for port 80 here any more: with XUI_SSL_MODE=none the installer
+# never runs ACME. SelfSteal gets :80 from setup_security (80:Caddy-ACME), and the
+# old `ufw delete allow 80/tcp` could even drop that rule on a --force re-run.
+install_3xui() {
     log_info "Installing 3X-UI panel..."
 
-    # Open port 80 temporarily — the installer uses it for Let's Encrypt SSL cert
-    ufw allow 80/tcp comment "ACME temp" > /dev/null 2>&1 || true
-
-    # Pin 3X-UI to v3.1.0 and pull install.sh from the SAME tag (not master) so the
-    # interactive prompt set is stable. Verified against the v3.1.0 installer source
-    # (config_after_install / prompt_and_setup_ssl), the fresh-install prompt order is:
-    #   1. Database type        [Choose [1]:]        blank → 1 = SQLite
-    #   2. Customize panel port? [y/n]               blank → random port
-    #   3. SSL method            [Choose (default 2)] → 4 = Skip SSL
-    #      (blank here defaults to 2 = Let's Encrypt IP cert, which runs acme.sh on
-    #       :80 and collides with Caddy — must explicitly pick 4)
-    #   4. Bind panel to 127.0.0.1 only? [y/N]       blank → N (keep all-interfaces)
-    # The SSL prompt is the 3rd read, not the 2nd — feeding 4 too early lands it on the
-    # panel-port question and leaves SSL at its IP-cert default. Order matters.
-    {
-        printf '\n'   # 1. DB type            → SQLite (default 1)
-        printf '\n'   # 2. Customize port?    → no (random port)
-        printf '4\n'  # 3. SSL method         → Skip SSL
-        printf '\n'   # 4. Bind to 127.0.0.1? → N (all interfaces)
-        printf '\n%.0s' {1..96}  # any further/unexpected prompts: accept defaults
-    } > /tmp/xui-answers
-    bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/v3.1.0/install.sh) v3.1.0 < /tmp/xui-answers
-    rm -f /tmp/xui-answers
-
-    # Close temporary port 80 — unless Caddy needs it permanently (SelfSteal mode)
-    if [[ "$skip_acme_port" != true ]]; then
-        ufw delete allow 80/tcp > /dev/null 2>&1 || true
-    fi
+    run_3xui_installer
 
     if command -v x-ui &> /dev/null; then
         log_ok "3X-UI installed"
     else
         log_error "3X-UI installation failed"
         exit 1
+    fi
+}
+
+# True if any piece of a 3X-UI install is present (binary, menu script, unit or DB).
+xui_panel_installed() {
+    [[ -e "${XUI_MAIN_FOLDER:-/usr/local/x-ui}" || -e /usr/bin/x-ui || -e "$XUI_DB" || \
+       -e /etc/systemd/system/x-ui.service ]]
+}
+
+# Remove the 3X-UI panel from an EXIT server (issue #40). The exit panel is purely
+# decorative — traffic is the standalone xray.service (/usr/local/bin/xray) +
+# hysteria-server; the panel runs its own xray copy from /usr/local/x-ui/bin and
+# has no inbounds. Manual teardown instead of `x-ui uninstall`: that one is
+# interactive, warns "xray will also uninstalled" and deletes itself mid-run, and
+# we want to keep control of exactly what goes (never /usr/local/bin/xray,
+# /usr/local/etc/xray, /var/log/xray, Caddy, Hysteria).
+# The DB is backed up to /root first (0600). The UFW rule for the panel port is
+# closed: the port from the DB's webPort plus any rule carrying our "3X-UI Panel"
+# comment — never 80/443/SSH. Idempotent: on a box without a panel it is a no-op.
+# $1 = SSH port (protected from the UFW cleanup), default 22.
+# $2 = "force" to purge even if the panel has inbounds of its own.
+# Refuses on a relay (its panel is the real one) and, without force, on an exit
+# panel that has inbounds — someone uses it for something, don't destroy it silently.
+purge_3xui_panel() {
+    local ssh_port="${1:-22}" force="${2:-}"
+    local panel_port="" inbounds="" backup ts f2b_changed=false f svc unit_path
+
+    if ! xui_panel_installed; then
+        log_info "3X-UI panel not installed — nothing to purge"
+        return 0
+    fi
+    # Relay markers: our API token file, or the system xray disabled because 3X-UI
+    # runs the real one. Never purge there.
+    if [[ -f "${XUI_API_TOKEN_FILE:-/etc/vpn-cli/api-token}" ]] || ! systemctl is-enabled --quiet xray 2>/dev/null; then
+        log_error "This looks like a relay (3X-UI manages xray here) — refusing to remove the panel"
+        return 1
+    fi
+    if [[ -f "$XUI_DB" ]]; then
+        inbounds=$(sqlite3 "$XUI_DB" <<< "SELECT COUNT(*) FROM inbounds;" 2>/dev/null) || inbounds=""
+    fi
+    if [[ "$inbounds" =~ ^[0-9]+$ ]] && (( inbounds > 0 )) && [[ "$force" != force ]]; then
+        log_warn "3X-UI panel on exit has ${inbounds} inbound(s) of its own — NOT removing it."
+        log_warn "  Remove anyway: ./setup.sh update-exit --purge-3xui (DB is backed up to /root first)"
+        return 0
+    fi
+    log_info "Removing decorative 3X-UI panel from exit (issue #40)..."
+
+    # Read before anything is deleted (works while the panel runs, WAL included)
+    if [[ -f "$XUI_DB" ]]; then
+        panel_port=$(sqlite3 "$XUI_DB" <<< "SELECT value FROM settings WHERE key='webPort';" 2>/dev/null) || true
+    fi
+
+    # Older installers may have put the unit elsewhere (e.g. /usr/lib/systemd/system)
+    unit_path=$(systemctl show -p FragmentPath --value x-ui 2>/dev/null) || unit_path=""
+
+    systemctl stop x-ui 2>/dev/null || true
+    systemctl disable x-ui 2>/dev/null || true
+
+    # Backup after stop: the panel has flushed its state; .backup folds in the WAL
+    if [[ -f "$XUI_DB" ]]; then
+        ts=$(date +%Y%m%d-%H%M%S)
+        backup="/root/x-ui-exit-backup-${ts}.db"
+        install -m 0600 /dev/null "$backup"
+        if ! sqlite3 "$XUI_DB" <<< ".backup '${backup}'" 2>/dev/null; then
+            cp "$XUI_DB" "$backup" || log_warn "3X-UI DB backup failed — continuing (exit traffic does not depend on the panel)"
+        fi
+        chmod 0600 "$backup"
+        log_ok "3X-UI DB backed up: $backup"
+    fi
+
+    rm -f /etc/systemd/system/x-ui.service /etc/systemd/system/multi-user.target.wants/x-ui.service
+    if [[ "$unit_path" == */x-ui.service ]]; then
+        rm -f "$unit_path"
+    fi
+    rm -rf /etc/systemd/system/x-ui.service.d
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed x-ui 2>/dev/null || true
+
+    rm -rf "${XUI_MAIN_FOLDER:-/usr/local/x-ui}" /etc/x-ui /var/log/x-ui
+    rm -f /usr/bin/x-ui /etc/default/x-ui
+
+    # IP Limit fail2ban bits of `x-ui setup-fail2ban` (we always ran the installer
+    # with XUI_ENABLE_FAIL2BAN=false, so normally absent). Our jail.local stays.
+    for f in /etc/fail2ban/jail.d/3x-ipl.conf /etc/fail2ban/jail.d/3x-ipl-backend.conf \
+             /etc/fail2ban/filter.d/3x-ipl.conf /etc/fail2ban/action.d/3x-ipl.conf; do
+        if [[ -e "$f" ]]; then
+            rm -f "$f"
+            f2b_changed=true
+        fi
+    done
+    if [[ "$f2b_changed" == true ]]; then
+        systemctl restart fail2ban 2>/dev/null || true
+        log_ok "Removed 3X-UI IP Limit fail2ban jail"
+    fi
+
+    # UFW: DB webPort + every rule labelled "3X-UI Panel" (the port may have been
+    # changed in the panel since setup). Never 22/80/443/SSH.
+    close_xui_ufw_ports "$ssh_port" "$panel_port"
+    cleanup_acme_panel_leftovers
+
+    log_ok "3X-UI panel removed (standalone xray untouched)"
+
+    # The panel never managed these — make sure they are still up
+    for svc in xray caddy hysteria-server; do
+        systemctl is-enabled --quiet "$svc" 2>/dev/null || continue
+        if systemctl is-active --quiet "$svc"; then
+            log_ok "${svc} still running"
+        else
+            log_warn "${svc} is not running after the panel removal — check: journalctl -u ${svc}"
+        fi
+    done
+}
+
+# SelfSteal relay (issue #40): the panel and the subscription server are reached
+# only through Caddy (reverse_proxy 127.0.0.1:<port>) — bind both to loopback so
+# they don't answer on the public IP even with UFW off. Direct DB write: MUST run
+# inside an `x-ui stop` ... `x-ui start` window. lib/xui-api.sh and sub-proxy
+# (SUB_UPSTREAM) already talk to 127.0.0.1.
+# $1 = "with-sub" to bind the subscription server too — only when Caddy proxies it
+# (a subscription domain is set). Without one the admin may serve subscriptions
+# straight from IP:subPort, and loopback would silently kill that.
+xui_bind_loopback() {
+    xui_db_set "webListen" "127.0.0.1"
+    if [[ "${1:-}" == "with-sub" ]]; then
+        xui_db_set "subListen" "127.0.0.1"
     fi
 }
 
@@ -79,18 +286,79 @@ disable_acme_cron() {
     fi
 }
 
+# xui_db_backup DEST — consistent snapshot of $XUI_DB into DEST (mode 0600: the DB
+# holds panel credentials and client UUIDs). A plain `cp` of a WAL-mode DB while the
+# panel runs misses commits that still sit in x-ui.db-wal and can copy a torn page
+# set; sqlite's online backup API reads a consistent snapshot through the WAL and is
+# safe against a running panel. Busy timeout covers a panel holding the write lock.
+# Fallback (sqlite3 .backup failed): stop x-ui (flushes memory to the DB, releases
+# locks), retry .backup; if that fails too, wal_checkpoint(TRUNCATE) + `cp` the main
+# file. x-ui is started again afterwards.
+# Either way the result must pass integrity_check, otherwise exit 1 (nothing has
+# been modified yet, so refusing to continue without a usable backup is safe).
+xui_db_backup() {
+    local dest="$1" check=""
+    if ! (umask 077 && sqlite3 -cmd ".timeout 10000" "$XUI_DB" <<< ".backup '${dest//\'/\'\'}'") 2>/dev/null; then
+        log_warn "sqlite3 .backup failed — retrying with x-ui stopped"
+        rm -f "$dest"
+        x-ui stop || true
+        if ! (umask 077 && sqlite3 "$XUI_DB" <<< ".backup '${dest//\'/\'\'}'") 2>/dev/null; then
+            # Fold any leftover WAL into the main file first, or cp misses commits
+            # (integrity_check below checks structure, not completeness).
+            rm -f "$dest"
+            sqlite3 "$XUI_DB" <<< "PRAGMA wal_checkpoint(TRUNCATE);" > /dev/null 2>&1 || true
+            # || true: x-ui must come back up even if cp fails (full disk is the
+            # likely reason both .backup runs failed); integrity_check below refuses.
+            (umask 077 && cp "$XUI_DB" "$dest") || true
+        fi
+        x-ui start
+    fi
+    chmod 0600 "$dest" 2>/dev/null || true
+    # .backup copies the WAL flag in the header too; switch the copy to rollback-
+    # journal mode so it is one self-contained file (no DEST-wal to lose on restore).
+    # The panel re-applies its own journal mode when it opens a restored DB.
+    sqlite3 "$dest" "PRAGMA journal_mode=DELETE;" > /dev/null 2>&1 || true
+    rm -f "${dest}-shm"
+    check=$(sqlite3 "$dest" "PRAGMA integrity_check;" 2>/dev/null) || true
+    if [[ "$check" != "ok" ]]; then
+        log_error "DB backup $dest failed integrity_check (${check:-no output}) — aborting before any change"
+        exit 1
+    fi
+}
+
+# xui_db_restore SRC — put backup SRC back as $XUI_DB. Stops x-ui first: on shutdown
+# the panel writes its in-memory state to the DB, so restoring under a running panel
+# gets overwritten. Stale x-ui.db-wal / -shm / -journal are removed — sqlite would
+# otherwise replay the post-backup WAL frames (or a hot rollback journal) on top of
+# the restored file. The caller starts x-ui afterwards. Returns 1 if x-ui can't be
+# stopped (restoring then would be pointless).
+xui_db_restore() {
+    local src="$1"
+    x-ui stop || true
+    if systemctl is-active --quiet x-ui; then
+        systemctl stop x-ui || true
+        if systemctl is-active --quiet x-ui; then
+            log_error "x-ui still running — not restoring $src (its shutdown would overwrite it)"
+            return 1
+        fi
+    fi
+    rm -f "${XUI_DB}-wal" "${XUI_DB}-shm" "${XUI_DB}-journal"
+    # cp onto the existing file keeps x-ui.db's own owner/mode
+    cp "$src" "$XUI_DB"
+}
+
 # Set a key-value pair in x-ui settings database
 xui_db_set() {
     local key="${1//\'/\'\'}"
     local value="${2//\'/\'\'}"
 
     local exists
-    exists=$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM settings WHERE key='$key';")
+    exists=$(sqlite3 "$XUI_DB" <<< "SELECT COUNT(*) FROM settings WHERE key='$key';")
 
     if [[ "$exists" -gt 0 ]]; then
-        sqlite3 "$XUI_DB" "UPDATE settings SET value='$value' WHERE key='$key';"
+        sqlite3 "$XUI_DB" <<< "UPDATE settings SET value='$value' WHERE key='$key';"
     else
-        sqlite3 "$XUI_DB" "INSERT INTO settings (key, value) VALUES ('$key', '$value');"
+        sqlite3 "$XUI_DB" <<< "INSERT INTO settings (key, value) VALUES ('$key', '$value');"
     fi
 }
 
@@ -116,6 +384,9 @@ configure_3xui() {
     # Set admin credentials
     "$XUI_BIN" setting -username "$admin_user" -password "$admin_pass"
 
+    # Same window: drop the admin token install.sh minted and printed
+    revoke_installer_api_tokens
+
     # Start with new settings
     x-ui start
 
@@ -139,16 +410,35 @@ configure_3xui_relay_template() {
     local extra_json
     extra_json=$(xhttp_extra_json)
 
+    # xray-core 26.10+: a freedom outbound blocks private destinations by default
+    # when the traffic came in via a vless inbound. proxy-exit dials the exit
+    # through `fragment` (freedom), so a private/CGNAT exit IP (relay and exit in
+    # one provider network) is dropped with "proxy/freedom: blocked target".
+    # finalRules are matched before that default block — allow exactly the exit
+    # IP, every other private destination stays blocked (issue #59). The rule has
+    # an `ip` key, so 3X-UI's FreedomFinalRulesPrivateEgressBlock seeder leaves it
+    # alone. Public exit IP → no finalRules (default behaviour, nothing to allow).
+    local fragment_final_rules='null'
+    if is_private_ipv4 "$exit_ip"; then
+        fragment_final_rules=$(jq -n -c --rawfile ip <(printf '%s' "$exit_ip") '[{action: "allow", ip: [$ip]}]')
+        log_warn "Exit IP $exit_ip is a private/CGNAT address — allowing exactly this IP"
+        log_warn "  in the 'fragment' outbound finalRules (xray-core 26.10+ blocks private targets)."
+        log_warn "  The Relay channel works only if this relay reaches $exit_ip directly."
+        log_warn "  Direct Exit / CDN asymmetric / Hysteria links also point to $exit_ip"
+        log_warn "  and are unreachable for clients outside that private network."
+    fi
+
     local template
     template=$(jq -n -c \
-        --arg exit_ip "$exit_ip" \
+        --rawfile exit_ip <(printf '%s' "$exit_ip") \
         --argjson exit_port "$exit_port" \
-        --arg exit_uuid "$exit_uuid" \
-        --arg exit_pubkey "$exit_pubkey" \
-        --arg exit_short_id "$exit_short_id" \
-        --arg exit_sni "$exit_sni" \
+        --rawfile exit_uuid <(printf '%s' "$exit_uuid") \
+        --rawfile exit_pubkey <(printf '%s' "$exit_pubkey") \
+        --rawfile exit_short_id <(printf '%s' "$exit_short_id") \
+        --rawfile exit_sni <(printf '%s' "$exit_sni") \
         --argjson api_port "$api_port" \
         --argjson extra "$extra_json" \
+        --argjson fragment_final_rules "$fragment_final_rules" \
         '{
             log: {
                 loglevel: "warning",
@@ -220,13 +510,15 @@ configure_3xui_relay_template() {
                 {
                     tag: "fragment",
                     protocol: "freedom",
-                    settings: {
+                    settings: ({
                         fragment: {
                             packets: "tlshello",
                             length: "100-200",
                             interval: "10-20"
                         }
                     }
+                    + (if $fragment_final_rules == null then {}
+                       else {finalRules: $fragment_final_rules} end))
                 }
             ],
             routing: {
@@ -282,13 +574,13 @@ create_3xui_relay_inbound() {
     extra_json=$(xhttp_extra_json)
     lf_json=$(reality_limit_fallback_json)
     stream_settings=$(jq -n -c \
-        --arg private_key "$private_key" \
-        --arg public_key "$public_key" \
-        --arg short_id "$short_id" \
-        --arg dest "$dest" \
-        --arg server_name "$server_name" \
+        --rawfile private_key <(printf '%s' "$private_key") \
+        --rawfile public_key <(printf '%s' "$public_key") \
+        --rawfile short_id <(printf '%s' "$short_id") \
+        --rawfile dest <(printf '%s' "$dest") \
+        --rawfile server_name <(printf '%s' "$server_name") \
         --argjson xver "$xver" \
-        --arg relay_path "$relay_xhttp_path" \
+        --rawfile relay_path <(printf '%s' "$relay_xhttp_path") \
         --argjson extra "$extra_json" \
         --argjson lf "$lf_json" \
         '{
@@ -312,10 +604,10 @@ create_3xui_relay_inbound() {
     # v3 inbounds/add: settings/streamSettings/sniffing are escaped JSON STRINGS.
     local inbound_json
     inbound_json=$(jq -n -c \
-        --arg remark "$remark" \
-        --arg settings "$settings" \
-        --arg stream "$stream_settings" \
-        --arg sniffing "$sniffing" \
+        --rawfile remark <(printf '%s' "$remark") \
+        --rawfile settings <(printf '%s' "$settings") \
+        --rawfile stream <(printf '%s' "$stream_settings") \
+        --rawfile sniffing <(printf '%s' "$sniffing") \
         '{
             remark: $remark, port: 443, protocol: "vless",
             enable: true, expiryTime: 0, total: 0, listen: "",
@@ -332,7 +624,7 @@ create_3xui_relay_inbound() {
     # the inbound id stays internal and this function returns nothing on stdout —
     # log_* write to stdout, which would otherwise pollute a captured return value.
     local seed_client
-    seed_client=$(jq -n -c --arg id "$relay_uuid" --arg s "$sub_id" \
+    seed_client=$(jq -n -c --rawfile id <(printf '%s' "$relay_uuid") --rawfile s <(printf '%s' "$sub_id") \
         '{id:$id, email:"default-user", flow:"", limitIp:0, totalGB:0, expiryTime:0, enable:true, subId:$s, tgId:0, reset:0, comment:""}')
     xui_api_add_client "$inbound_id" "$seed_client" \
         || { log_error "Failed to create seed client (default-user)"; return 1; }
@@ -458,8 +750,8 @@ create_3xui_cdn_inbound() {
     local settings stream_settings sniffing
 
     settings=$(jq -n -c \
-        --arg uuid "$exit_uuid" \
-        --arg sub_id "$sub_id" \
+        --rawfile uuid <(printf '%s' "$exit_uuid") \
+        --rawfile sub_id <(printf '%s' "$sub_id") \
         '{
             clients: [{
                 id: $uuid,
@@ -477,7 +769,7 @@ create_3xui_cdn_inbound() {
         }')
 
     stream_settings=$(jq -n -c \
-        --arg cdn_path "$cdn_path" \
+        --rawfile cdn_path <(printf '%s' "$cdn_path") \
         '{
             network: "xhttp",
             security: "none",
@@ -491,7 +783,7 @@ create_3xui_cdn_inbound() {
 
     local external_proxy
     external_proxy=$(jq -n -c \
-        --arg dest "$cdn_domain" \
+        --rawfile dest <(printf '%s' "$cdn_domain") \
         '[{
             forceTls: "tls",
             dest: $dest,
@@ -508,10 +800,10 @@ create_3xui_cdn_inbound() {
     # Check if externalProxy column exists
     local has_external_proxy
     has_external_proxy=$(sqlite3 "$XUI_DB" \
-        "SELECT COUNT(*) FROM pragma_table_info('inbounds') WHERE name='externalProxy';")
+        <<< "SELECT COUNT(*) FROM pragma_table_info('inbounds') WHERE name='externalProxy';")
 
     if [[ "$has_external_proxy" -gt 0 ]]; then
-        sqlite3 "$XUI_DB" "INSERT INTO inbounds (
+        sqlite3 "$XUI_DB" <<< "INSERT INTO inbounds (
             user_id, up, down, total, remark, enable, expiry_time,
             listen, port, protocol, settings, stream_settings,
             tag, sniffing, externalProxy
@@ -527,7 +819,7 @@ create_3xui_cdn_inbound() {
         log_warn "CDN profile will not appear in subscriptions automatically"
         log_warn "Upgrade 3X-UI to latest version for full CDN subscription support"
         # Still create inbound without externalProxy
-        sqlite3 "$XUI_DB" "INSERT INTO inbounds (
+        sqlite3 "$XUI_DB" <<< "INSERT INTO inbounds (
             user_id, up, down, total, remark, enable, expiry_time,
             listen, port, protocol, settings, stream_settings,
             tag, sniffing
@@ -548,7 +840,7 @@ patch_3xui_cdn_inbound() {
 
     local current_settings
     current_settings=$(sqlite3 "$XUI_DB" \
-        "SELECT settings FROM inbounds WHERE tag='inbound-cdn';") || return 0
+        <<< "SELECT settings FROM inbounds WHERE tag='inbound-cdn';") || return 0
 
     if [[ -z "$current_settings" ]]; then
         log_warn "CDN inbound not found, skipping patch"
@@ -557,11 +849,11 @@ patch_3xui_cdn_inbound() {
 
     local patched_settings
     patched_settings=$(echo "$current_settings" | jq -c \
-        --arg sub_id "$sub_id" \
+        --rawfile sub_id <(printf '%s' "$sub_id") \
         '.clients[0].subId = $sub_id | .clients[0].tgId = 0 | .clients[0].reset = 0')
     local s_settings="${patched_settings//\'/\'\'}"
     sqlite3 "$XUI_DB" \
-        "UPDATE inbounds SET settings='${s_settings}' WHERE tag='inbound-cdn';"
+        <<< "UPDATE inbounds SET settings='${s_settings}' WHERE tag='inbound-cdn';"
 
     log_ok "CDN inbound patched (subId for subscriptions)"
 }
@@ -578,7 +870,7 @@ sync_cdn_clients() {
 
     # Shared exit UUID = the UUID of the existing CDN inbound's client set.
     # Read it from the CDN inbound's settings JSON (read-only, sqlite is fine).
-    exit_uuid=$(sqlite3 "$XUI_DB" "SELECT settings FROM inbounds WHERE tag='inbound-cdn';" \
+    exit_uuid=$(sqlite3 "$XUI_DB" <<< "SELECT settings FROM inbounds WHERE tag='inbound-cdn';" \
         | jq -r 'first(.clients[]?.id) // empty') || true
     if [[ -z "$exit_uuid" ]]; then
         log_warn "Cannot determine CDN exit UUID — skipping CDN sync"
@@ -589,7 +881,7 @@ sync_cdn_clients() {
     local relay_clients
     # Read relay clients from inbound-443 settings JSON: on v3 the API's clients/add
     # back-writes this JSON in addition to the normalized tables, so it stays current.
-    relay_clients=$(sqlite3 "$XUI_DB" "SELECT settings FROM inbounds WHERE tag='inbound-443';" \
+    relay_clients=$(sqlite3 "$XUI_DB" <<< "SELECT settings FROM inbounds WHERE tag='inbound-443';" \
         | jq -c '[.clients[]? | {email: (.email + "-cdn"), subId: .subId, enable: .enable}]') || true
     [[ -z "$relay_clients" || "$relay_clients" == "null" ]] && relay_clients='[]'
     # Safety: a relay always has >=1 client (default-user). An empty desired set
@@ -609,10 +901,10 @@ sync_cdn_clients() {
     desired_emails=$(printf '%s' "$relay_clients" | jq -r '.[].email')
     while IFS= read -r email; do
         [[ -z "$email" ]] && continue
-        if ! printf '%s' "$current_cdn" | jq -e --arg e "$email" 'index($e) != null' >/dev/null; then
+        if ! printf '%s' "$current_cdn" | jq -e --rawfile e <(printf '%s' "$email") 'index($e) != null' >/dev/null; then
             local sub_id client_json
-            sub_id=$(printf '%s' "$relay_clients" | jq -r --arg e "$email" 'first(.[]|select(.email==$e).subId)')
-            client_json=$(jq -n -c --arg id "$exit_uuid" --arg e "$email" --arg s "$sub_id" \
+            sub_id=$(printf '%s' "$relay_clients" | jq -r --rawfile e <(printf '%s' "$email") 'first(.[]|select(.email==$e).subId)')
+            client_json=$(jq -n -c --rawfile id <(printf '%s' "$exit_uuid") --rawfile e <(printf '%s' "$email") --rawfile s <(printf '%s' "$sub_id") \
                 '{id:$id, email:$e, flow:"", limitIp:0, totalGB:0, expiryTime:0, enable:true, subId:$s, tgId:0, reset:0, comment:""}')
             xui_api_add_client "$cdn_id" "$client_json" \
                 || log_warn "CDN sync: failed to add $email (continuing)"
@@ -623,7 +915,7 @@ sync_cdn_clients() {
     local cur_email
     while IFS= read -r cur_email; do
         [[ -z "$cur_email" ]] && continue
-        if ! printf '%s' "$relay_clients" | jq -e --arg e "$cur_email" 'any(.[]; .email==$e)' >/dev/null; then
+        if ! printf '%s' "$relay_clients" | jq -e --rawfile e <(printf '%s' "$cur_email") 'any(.[]; .email==$e)' >/dev/null; then
             xui_api_del_client "$cur_email" || log_warn "CDN sync: failed to remove $cur_email"
         fi
     done < <(printf '%s' "$current_cdn" | jq -r '.[]')

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Update exit server configuration from latest codebase
-# Run: ./setup.sh update-exit [--upgrade] [--enable-warp|--disable-warp]
+# Run: ./setup.sh update-exit [--upgrade] [--enable-warp|--disable-warp] [--keep-3xui|--purge-3xui]
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
@@ -13,19 +13,24 @@ source "$SCRIPT_DIR/lib/verify.sh"
 source "$SCRIPT_DIR/lib/caddy.sh"
 
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
-XUI_DB="/etc/x-ui/x-ui.db"
 
 main() {
-    local upgrade=false skip_ssh=false enable_warp=false disable_warp=false
+    local upgrade=false skip_ssh=false enable_warp=false disable_warp=false keep_3xui=false purge_3xui=false
     for arg in "$@"; do
         case "$arg" in
             --upgrade) upgrade=true ;;
             --skip-ssh) skip_ssh=true ;;
             --enable-warp) enable_warp=true ;;
             --disable-warp) disable_warp=true ;;
+            --keep-3xui) keep_3xui=true ;;
+            --purge-3xui) purge_3xui=true ;;
         esac
     done
 
+    if [[ "$keep_3xui" == true && "$purge_3xui" == true ]]; then
+        log_error "--keep-3xui and --purge-3xui are mutually exclusive"
+        exit 1
+    fi
     if [[ "$enable_warp" == true && "$disable_warp" == true ]]; then
         log_error "--enable-warp and --disable-warp are mutually exclusive"
         exit 1
@@ -86,7 +91,8 @@ main() {
     fi
     server_name=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$XRAY_CONFIG")
     listen_port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")
-    public_key=$(xray x25519 -i "$private_key" 2>/dev/null | grep -iE "public|password" | awk '{print $NF}')
+    public_key=$(reality_public_key_from_private "$private_key")
+    [[ -n "$public_key" ]] || log_warn "Could not derive the Reality public key from the config (openssl) — EXIT_PUBLIC_KEY in the info file will be empty"
 
     if [[ -z "$uuid" || "$uuid" == "null" ]]; then
         log_error "Failed to extract UUID from config"
@@ -142,10 +148,26 @@ main() {
     log_info "  DNS mode: $dns_mode"
     log_info "  WARP:     $warp_enabled"
 
-    # Read panel port from 3X-UI DB (for UFW and verification)
-    local panel_port=""
-    if [[ -f "$XUI_DB" ]]; then
-        panel_port=$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='webPort';" 2>/dev/null) || true
+    local ssh_port
+    ssh_port=$(detect_ssh_port)
+
+    # --- Step 2a: Remove the decorative 3X-UI panel (issue #40) ---
+    # Exit traffic never touched it (standalone xray.service + hysteria); it only
+    # exposed a plain-HTTP admin port. Before Step 4 so --upgrade can't reinstall it.
+    # --keep-3xui leaves the panel exactly as it is (not upgraded, not managed by
+    # these scripts any more, its UFW rule stays) — a plain update-exit removes it later.
+    if xui_panel_installed; then
+        if [[ "$keep_3xui" == true ]]; then
+            log_warn "3X-UI panel kept (--keep-3xui): it is no longer upgraded or checked by these scripts."
+            log_warn "  Its port stays open in UFW (plain HTTP admin) and installer API tokens are no longer revoked."
+            log_warn "  Remove it with a plain './setup.sh update-exit'."
+        else
+            if [[ "$purge_3xui" == true ]]; then
+                purge_3xui_panel "$ssh_port" force
+            else
+                purge_3xui_panel "$ssh_port"
+            fi
+        fi
     fi
 
     # --- Step 2b: Heal Caddy socket perms (issue #42) ---
@@ -173,27 +195,10 @@ main() {
         version=$(xray version 2>/dev/null | head -1 || true)
         log_ok "XRAY upgraded: $version"
 
-        if command -v x-ui &> /dev/null; then
-            log_info "Upgrading 3X-UI..."
-            # Pinned to v3.1.0 — see scripts/lib/3xui.sh:install_3xui. Exit panel is
-            # decorative (real exit xray is standalone) — no API migration needed.
-            # On an already-configured panel install.sh skips the DB/port prompts; the
-            # only question is SSL (then a bind-to-127.0.0.1 y/N when SSL=4). The SSL
-            # answer (4 = Skip) must be FIRST — a leading blank would default SSL to
-            # option 2 (LE IP cert, acme on :80, collides with Caddy).
-            {
-                printf '4\n'  # SSL method         → Skip SSL
-                printf '\n'   # Bind to 127.0.0.1? → N (all interfaces)
-                printf '\n%.0s' {1..98}  # any further/unexpected prompts: accept defaults
-            } > /tmp/xui-answers
-            bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/v3.1.0/install.sh) v3.1.0 < /tmp/xui-answers
-            rm -f /tmp/xui-answers
-            log_ok "3X-UI upgraded to v3.1.0"
-        fi
-
         if [[ "$is_selfsteal" == true ]]; then
             log_info "Upgrading Caddy..."
-            apt-get update -qq && apt-get install -y -qq caddy > /dev/null 2>&1
+            apt_update_retry
+            apt-get install -y -qq caddy > /dev/null 2>&1
             log_ok "Caddy upgraded"
         fi
     fi
@@ -222,6 +227,7 @@ main() {
         log_ok "Previous config restored, XRAY is running"
         exit 1
     fi
+    prune_backups "${XRAY_CONFIG}.bak." 5
 
     # Stop WARP only AFTER successful xray restart — otherwise a config rollback
     # leaves xray referencing a disconnected WARP socks5 listener.
@@ -232,7 +238,7 @@ main() {
         log_ok "WARP daemon stopped (package preserved — use uninstall --purge-warp to remove)"
     fi
 
-    # 3X-UI installer leaves an acme.sh cron behind that conflicts with Caddy on :80
+    # The 3X-UI installer of older setups left an acme.sh cron behind that conflicts with Caddy on :80
     if [[ "$is_selfsteal" == true ]]; then
         disable_acme_cron
     fi
@@ -275,17 +281,11 @@ main() {
 
     # --- Step 6: Security ---
     log_info "=== Security ==="
-    local ssh_port
-    ssh_port=$(grep -E '^Port ' /etc/ssh/sshd_config 2>/dev/null | head -1 | awk '{print $2}') || true
-    ssh_port="${ssh_port:-22}"
     log_info "Current SSH port: $ssh_port"
 
     local security_args=()
     [[ "$skip_ssh" == true ]] && security_args+=("--skip-ssh")
-    security_args+=(--ssh-port "$ssh_port" "$ssh_port":SSH 443:XRAY)
-    if [[ -n "$panel_port" ]]; then
-        security_args+=("$panel_port:3X-UI Panel")
-    fi
+    security_args+=(--soft-ssh --ssh-port "$ssh_port" "$ssh_port":SSH 443:XRAY)
     if [[ "$is_selfsteal" == true ]]; then
         security_args+=(80:Caddy-ACME)
     fi
@@ -357,7 +357,11 @@ EOF
     if [[ "$upgrade" == true ]]; then
         echo "  Binaries upgraded to latest versions"
     fi
-    echo "  Security re-applied"
+    if [[ "${SSH_HARDENING_SKIPPED:-false}" == true ]]; then
+        log_warn "  Security re-applied WITHOUT SSH hardening — another sshd_config.d file overrides it (see the error above)"
+    else
+        echo "  Security re-applied"
+    fi
     if [[ "$warp_enabled" == "Y" ]]; then
         echo "  WARP outbound:        enabled (AI services)"
     fi
@@ -368,5 +372,7 @@ EOF
 }
 
 LOG_FILE="/var/log/vpn-setup-$(basename "$0" .sh)-$(date +%Y%m%d-%H%M%S).log"
+# Root-only, same as the other setup/update logs.
+install -m 0600 /dev/null "$LOG_FILE"
 main "$@" 2>&1 | tee "$LOG_FILE"
 exit "${PIPESTATUS[0]}"
